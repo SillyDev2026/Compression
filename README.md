@@ -77,4 +77,4 @@ A packet encoded with schema version 3 will not silently decode through schema v
 
 ## Version
 
-`1.5.5`
+`1.0.0`
