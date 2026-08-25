@@ -4,15 +4,36 @@
 local Compression = {}
 
 export type Mode = "Binary" | "BinaryWithHash"
+export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "Identifier6" | "Numeric4"
+export type TableStrategy = "Auto" | "Compact" | "Dynamic"
+export type BufferStrategy = "Auto" | "Raw" | "LZ" | "Sparse" | "Nibble"
 
 export type Options = {
 	Mode: Mode?,
 	CompressStrings: boolean?,
 	StringMinLength: number?,
+	StringStrategy: StringStrategy?,
+	StringSearchDepth: number?,
+	StringWindowSize: number?,
+	StringMaxMatch: number?,
 	VerifyHash: boolean?,
 	SchemaVersion: number?,
 	UseStringDictionary: boolean?,
 	DictionaryMinUses: number?,
+	MaxDictionaryEntries: number?,
+	TableCompression: boolean?,
+	HomogeneousArrays: boolean?,
+	DeltaArrays: boolean?,
+	RunLengthArrays: boolean?,
+	CompactMapKeys: boolean?,
+	TableStrategy: TableStrategy?,
+	CompressBuffers: boolean?,
+	BufferStrategy: BufferStrategy?,
+	BufferMinLength: number?,
+	BufferSearchDepth: number?,
+	BufferWindowSize: number?,
+	BufferMaxMatch: number?,
+	AllowExpansion: boolean?,
 }
 
 export type Descriptor = {
@@ -29,6 +50,20 @@ export type Packet = {
 	Bytes: number,
 	Bits: number,
 	SchemaVersion: number?,
+	RawBytes: number?,
+	SavedBytes: number?,
+	ExpandedBytes: number?,
+	ByteDelta: number?,
+	SavingsPercent: number?,
+	Ratio: number?,
+	ValueType: string?,
+	Codec: string?,
+	Passthrough: boolean?,
+	UsefulBits: number?,
+	PhysicalBits: number?,
+	SavedBits: number?,
+	ExpandedBits: number?,
+	BitSavingsPercent: number?,
 }
 
 export type BitLayoutField = {
@@ -40,6 +75,7 @@ export type BitLayoutField = {
 	PhysicalBits: number,
 	RawBits: number,
 	SavedBits: number,
+	ExpandedBits: number,
 	SavingsPercent: number,
 }
 
@@ -51,6 +87,7 @@ export type BitLayout = {
 	PhysicalBytes: number,
 	RawBits: number,
 	SavedBits: number,
+	ExpandedBits: number,
 	SavingsPercent: number,
 	Fields: {BitLayoutField},
 }
@@ -70,6 +107,7 @@ type Reader = {
 	Length: number,
 	BitBuffer: number,
 	BitCount: number,
+	LegacyVarUInt: boolean,
 }
 
 type Field = {
@@ -93,30 +131,79 @@ type SchemaObject = {
 	PrintBitLayout: (self: SchemaObject, value: {[string]: any}) -> BitLayout,
 }
 
-local MAGIC_A = 0x43
-local MAGIC_B = 0x50
-local VERSION = 6
+local FMT = {
+	MAGIC_A = 0x43,
+	MAGIC_B = 0x50,
+	VERSION = 14,
+	COMPACT_NUMBER_MAGIC = 0xD7,
+	COMPACT_TABLE_MAGIC = 0xD5,
+	COMPACT_BUFFER_MAGIC = 0xD4,
+	COMPACT_BUFFER_RAW_MAGIC = 0xD3,
+}
 
-local MODE_DYNAMIC = 1
-local MODE_SCHEMA = 2
-local MODE_DELTA = 3
+local MODE = {
+	DYNAMIC = 1,
+	SCHEMA = 2,
+	DELTA = 3,
+}
 
-local TAG_NIL = 0
-local TAG_FALSE = 1
-local TAG_TRUE = 2
-local TAG_UINT = 3
-local TAG_INT = 4
-local TAG_FLOAT = 5
-local TAG_STRING = 6
-local TAG_STRING_REF = 7
-local TAG_ARRAY = 8
-local TAG_MAP = 9
-local TAG_VECTOR2 = 10
-local TAG_VECTOR3 = 11
-local TAG_COLOR3 = 12
-local TAG_CFRAME = 13
+local TAG = {
+	NIL = 0,
+	FALSE = 1,
+	TRUE = 2,
+	UINT = 3,
+	INT = 4,
+	FLOAT = 5,
+	STRING = 6,
+	STRING_REF = 7,
+	ARRAY = 8,
+	MAP = 9,
+	VECTOR2 = 10,
+	VECTOR3 = 11,
+	COLOR3 = 12,
+	CFRAME = 13,
+	ZERO = 14,
+	ONE = 15,
+	NEG_ONE = 16,
+	ARRAY_BOOL = 17,
+	ARRAY_UINT = 18,
+	ARRAY_INT = 19,
+	ARRAY_FLOAT = 20,
+	ARRAY_STRING = 21,
+	ARRAY_RLE = 22,
+	MAP_STRING = 23,
+	ARRAY_UINT_DELTA = 24,
+	ARRAY_INT_DELTA = 25,
+	POWER10 = 26,
+	BUFFER = 27,
+}
+
+local ATOM = {
+	NIL = 0xE0,
+	FALSE = 0xE1,
+	TRUE = 0xE2,
+	ZERO = 0xE3,
+	ONE = 0xE4,
+	NEG_ONE = 0xE5,
+	UINT = 0xE6,
+	INT = 0xE7,
+	FLOAT = 0xE8,
+	POWER10 = 0xE9,
+	STRING = 0xEA,
+	VECTOR2 = 0xEB,
+	VECTOR3 = 0xEC,
+	COLOR3 = 0xED,
+	CFRAME = 0xEE,
+	FLOAT32 = 0xEF,
+	DECIMAL = 0xF0,
+	VECTOR2_F32 = 0xF1,
+	VECTOR3_F32 = 0xF2,
+	CFRAME_F32 = 0xF3,
+}
 
 local DEFAULT_CAPACITY = 256
+local MAX_SAFE_INTEGER = 9007199254740991
+local MAX_SAFE_ZIGZAG_INTEGER = 4503599627370495
 
 local function fail(message: string, level: number?)
 	error("Compression: " .. message, (level or 1) + 1)
@@ -140,6 +227,7 @@ local function newReader(data: buffer): Reader
 		Length = buffer.len(data),
 		BitBuffer = 0,
 		BitCount = 0,
+		LegacyVarUInt = false,
 	}
 end
 
@@ -228,7 +316,7 @@ local function readBits(r: Reader, count: number): number
 end
 
 local function writeVarUInt(w: Writer, value: number)
-	if value < 0 or value % 1 ~= 0 then fail("expected unsigned integer", 2) end
+	if value < 0 or value % 1 ~= 0 or value > MAX_SAFE_INTEGER then fail("expected safe unsigned integer", 2) end
 	flushBits(w)
 	repeat
 		local byte = value % 128
@@ -242,9 +330,21 @@ local function readVarUInt(r: Reader): number
 	alignReader(r)
 	local result = 0
 	local multiplier = 1
-	for _ = 1, 10 do
+	if r.LegacyVarUInt then
+		for _ = 1, 256 do
+			local byte = readByte(r)
+			result += (byte % 128) * multiplier
+			if byte < 128 then return result end
+			multiplier *= 128
+			if multiplier == math.huge then fail("legacy VarUInt overflow", 2) end
+		end
+		fail("invalid legacy VarUInt", 2)
+		return 0
+	end
+	for _ = 1, 8 do
 		local byte = readByte(r)
 		result += (byte % 128) * multiplier
+		if result > MAX_SAFE_INTEGER then fail("VarUInt exceeds safe integer range", 2) end
 		if byte < 128 then return result end
 		multiplier *= 128
 	end
@@ -286,6 +386,29 @@ local function readF64(r: Reader): number
 	return value
 end
 
+local function writeF32(w: Writer, value: number)
+	flushBits(w)
+	ensureCapacity(w, 4)
+	buffer.writef32(w.Buffer, w.Position, value)
+	w.Position += 4
+	w.UsedBits += 32
+end
+
+local function readF32(r: Reader): number
+	alignReader(r)
+	if r.Position + 4 > r.Length then fail("truncated float32", 2) end
+	local value = buffer.readf32(r.Buffer, r.Position)
+	r.Position += 4
+	return value
+end
+
+local function exactFloat32(value: number): boolean
+	if value ~= value or value == math.huge or value == -math.huge then return false end
+	local data = buffer.create(4)
+	buffer.writef32(data, 0, value)
+	return buffer.readf32(data, 0) == value
+end
+
 local function writeStringRaw(w: Writer, value: string)
 	flushBits(w)
 	writeVarUInt(w, #value)
@@ -321,7 +444,28 @@ local function hashBuffer(data: buffer): number
 end
 
 local function isInteger(value: number): boolean
-	return value % 1 == 0
+	return value == value and value ~= math.huge and value ~= -math.huge and value % 1 == 0
+end
+
+local function isSafeUInt(value: number): boolean
+	return isInteger(value) and value >= 0 and value <= MAX_SAFE_INTEGER
+end
+
+local function isSafeInt(value: number): boolean
+	return isInteger(value) and math.abs(value) <= MAX_SAFE_ZIGZAG_INTEGER
+end
+
+local function varUIntByteLength(value: number): number
+	local bytes = 1
+	while value >= 128 do
+		value = math.floor(value / 128)
+		bytes += 1
+	end
+	return bytes
+end
+
+local function varIntByteLength(value: number): number
+	return varUIntByteLength(zigzagEncode(value))
 end
 
 local function isArray(value: {[any]: any}): boolean
@@ -334,21 +478,39 @@ end
 
 local function deepEqual(a: any, b: any): boolean
 	if a == b then return true end
-	if typeof(a) ~= typeof(b) then return false end
-	if typeof(a) ~= "table" then return false end
+	local kind = typeof(a)
+	if kind ~= typeof(b) then return false end
+	if kind == "buffer" then
+		local length = buffer.len(a)
+		if length ~= buffer.len(b) then return false end
+		for i = 0, length - 1 do
+			if buffer.readu8(a, i) ~= buffer.readu8(b, i) then return false end
+		end
+		return true
+	end
+	if kind ~= "table" then return false end
 	for key, value in pairs(a) do if not deepEqual(value, b[key]) then return false end end
 	for key, value in pairs(b) do if not deepEqual(value, a[key]) then return false end end
 	return true
 end
 
-local function collectStrings(value: any, counts: {[string]: number})
+local function dictionaryScore(value: string, count: number): number
+	local rawEntryCost = #value + varUIntByteLength(#value)
+	local approximateReferenceCost = count
+	local approximateInlineCost = count * (#value + 2)
+	return approximateInlineCost - (rawEntryCost + approximateReferenceCost)
+end
+
+local function collectStringsSafe(value: any, counts: {[string]: number}, seen: {[any]: boolean})
 	local kind = typeof(value)
 	if kind == "string" then
 		counts[value] = (counts[value] or 0) + 1
 	elseif kind == "table" then
+		if seen[value] then return end
+		seen[value] = true
 		for key, child in pairs(value) do
-			collectStrings(key, counts)
-			collectStrings(child, counts)
+			collectStringsSafe(key, counts, seen)
+			collectStringsSafe(child, counts, seen)
 		end
 	end
 end
@@ -357,19 +519,24 @@ local function makeDictionary(value: any, options: Options?): DictionaryState
 	local state: DictionaryState = {Encode = {}, Decode = {}}
 	if options and options.UseStringDictionary == false then return state end
 	local counts = {}
-	collectStrings(value, counts)
-	local minUses = options and options.DictionaryMinUses or 2
+	collectStringsSafe(value, counts, {})
+	local minUses = math.max(2, options and options.DictionaryMinUses or 2)
 	local candidates = {}
 	for stringValue, count in pairs(counts) do
-		if count >= minUses and #stringValue >= 3 then
-			candidates[#candidates + 1] = {Value = stringValue, Count = count}
+		local score = dictionaryScore(stringValue, count)
+		if count >= minUses and #stringValue >= 3 and score > 0 then
+			candidates[#candidates + 1] = {Value = stringValue, Count = count, Score = score}
 		end
 	end
 	table.sort(candidates, function(a, b)
-		if a.Count == b.Count then return a.Value < b.Value end
-		return a.Count > b.Count
+		if a.Score == b.Score then
+			if a.Count == b.Count then return a.Value < b.Value end
+			return a.Count > b.Count
+		end
+		return a.Score > b.Score
 	end)
-	for i = 1, math.min(255, #candidates) do
+	local maximum = math.clamp(options and options.MaxDictionaryEntries or 255, 0, 4095)
+	for i = 1, math.min(maximum, #candidates) do
 		local valueString = candidates[i].Value
 		state.Encode[valueString] = i
 		state.Decode[i] = valueString
@@ -377,110 +544,964 @@ local function makeDictionary(value: any, options: Options?): DictionaryState
 	return state
 end
 
-local function findStringMatch(value: string, position: number): (number, number)
-	local bestDistance = 0
-	local bestLength = 0
-	local start = math.max(1, position - 4095)
-	local maxLength = math.min(18, #value - position + 1)
-	if maxLength < 3 then return 0, 0 end
-	for candidate = position - 1, start, -1 do
-		local distance = position - candidate
-		local length = 0
-		while length < maxLength do
-			local source = candidate + (length % distance)
-			if string.byte(value, source) ~= string.byte(value, position + length) then break end
-			length += 1
-		end
-		if length > bestLength and length >= 3 then
-			bestLength = length
-			bestDistance = distance
-			if length == maxLength then break end
-		end
+local STR = {
+	RAW = 0,
+	LZ_V1 = 1,
+	NUMERIC4 = 2,
+	IDENTIFIER6 = 3,
+	ASCII7 = 4,
+	LZ_V2 = 5,
+	RAW_V3 = 6,
+}
+
+local IDENTIFIER_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+local IDENTIFIER_ENCODE: {[number]: number} = {}
+for i = 1, #IDENTIFIER_ALPHABET do IDENTIFIER_ENCODE[string.byte(IDENTIFIER_ALPHABET, i)] = i - 1 end
+
+local NUMERIC4_ENCODE: {[number]: number} = {}
+for i = 0, 9 do NUMERIC4_ENCODE[string.byte(tostring(i))] = i end
+NUMERIC4_ENCODE[string.byte("-")] = 10
+NUMERIC4_ENCODE[string.byte("+")] = 11
+NUMERIC4_ENCODE[string.byte(".")] = 12
+NUMERIC4_ENCODE[string.byte("e")] = 13
+NUMERIC4_ENCODE[string.byte("E")] = 14
+local NUMERIC4_DECODE = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", "+", ".", "e", "E"}
+
+local function rawStringPacket(value: string): buffer
+	if #value == 0 then return buffer.create(0) end
+	local first = string.byte(value, 1)
+	if first > STR.RAW_V3 then
+		local raw = buffer.create(#value)
+		buffer.writestring(raw, 0, value)
+		return raw
 	end
-	return bestDistance, bestLength
+	local w = newWriter(math.max(1, #value + 1))
+	writeByte(w, STR.RAW_V3)
+	flushBits(w)
+	ensureCapacity(w, #value)
+	buffer.writestring(w.Buffer, w.Position, value)
+	w.Position += #value
+	w.UsedBits += #value * 8
+	return finish(w)
 end
 
-function Compression.CompressString(value: string, options: Options?): buffer
-	if typeof(value) ~= "string" then fail("CompressString expects string", 2) end
-	local minLength = options and options.StringMinLength or 24
-	local w = newWriter(math.max(32, #value))
-	if #value < minLength then
-		writeByte(w, 0)
-		writeStringRaw(w, value)
-		return finish(w)
+local function numeric4Packet(value: string): buffer?
+	if #value == 0 then return nil end
+	for i = 1, #value do if NUMERIC4_ENCODE[string.byte(value, i)] == nil then return nil end end
+	local w = newWriter(math.max(4, math.ceil(#value / 2) + 2))
+	writeByte(w, STR.NUMERIC4)
+	local pending: number? = nil
+	for i = 1, #value do
+		local code = NUMERIC4_ENCODE[string.byte(value, i)] :: number
+		if pending == nil then pending = code else writeByte(w, (pending :: number) + code * 16); pending = nil end
 	end
-	local body = newWriter(math.max(32, #value))
-	local position = 1
-	while position <= #value do
-		local distance, length = findStringMatch(value, position)
-		if length >= 3 then
-			writeByte(body, 1)
-			local packed = (distance - 1) * 16 + (length - 3)
-			writeByte(body, math.floor(packed / 256))
-			writeByte(body, packed % 256)
-			position += length
-		else
-			local start = position
-			local count = 1
-			position += 1
-			while position <= #value and count < 255 do
-				local _, nextLength = findStringMatch(value, position)
-				if nextLength >= 3 then break end
-				count += 1
-				position += 1
-			end
-			writeByte(body, 0)
-			writeByte(body, count)
-			for i = start, start + count - 1 do writeByte(body, string.byte(value, i)) end
-		end
-	end
-	local compressed = finish(body)
-	if buffer.len(compressed) >= #value then
-		writeByte(w, 0)
-		writeStringRaw(w, value)
+	if pending == nil then
+		writeByte(w, 15 + 15 * 16)
 	else
-		writeByte(w, 1)
-		writeVarUInt(w, #value)
-		writeVarUInt(w, buffer.len(compressed))
-		ensureCapacity(w, buffer.len(compressed))
-		buffer.copy(w.Buffer, w.Position, compressed, 0, buffer.len(compressed))
-		w.Position += buffer.len(compressed)
-		w.UsedBits += buffer.len(compressed) * 8
+		writeByte(w, (pending :: number) + 15 * 16)
 	end
 	return finish(w)
 end
 
-function Compression.DecompressString(data: buffer): string
-	if typeof(data) ~= "buffer" then fail("DecompressString expects buffer", 2) end
-	local r = newReader(data)
-	local mode = readByte(r)
-	if mode == 0 then return readStringRaw(r) end
-	if mode ~= 1 then fail("invalid compressed string mode", 2) end
+local function identifier6Packet(value: string): buffer?
+	if #value == 0 then return nil end
+	for i = 1, #value do if IDENTIFIER_ENCODE[string.byte(value, i)] == nil then return nil end end
+	local w = newWriter(math.max(8, math.ceil(#value * 0.75) + 4))
+	writeByte(w, STR.IDENTIFIER6)
+	writeVarUInt(w, #value)
+	for i = 1, #value do writeBits(w, IDENTIFIER_ENCODE[string.byte(value, i)] :: number, 6) end
+	return finish(w)
+end
+
+local function ascii7Packet(value: string): buffer?
+	if #value == 0 then return nil end
+	for i = 1, #value do if string.byte(value, i) > 127 then return nil end end
+	local w = newWriter(math.max(8, math.ceil(#value * 0.875) + 4))
+	writeByte(w, STR.ASCII7)
+	writeVarUInt(w, #value)
+	for i = 1, #value do writeBits(w, string.byte(value, i), 7) end
+	return finish(w)
+end
+
+local function addStringIndex(index: {[string]: {number}}, value: string, position: number)
+	if position + 2 > #value then return end
+	local key = string.sub(value, position, position + 2)
+	local list = index[key]
+	if list == nil then list = {}; index[key] = list end
+	list[#list + 1] = position
+end
+
+local function indexedStringMatch(value: string, position: number, index: {[string]: {number}}, window: number, maxMatch: number, depth: number): (number, number)
+	if position + 2 > #value then return 0, 0 end
+	local list = index[string.sub(value, position, position + 2)]
+	if list == nil then return 0, 0 end
+	local bestDistance = 0
+	local bestLength = 0
+	local checked = 0
+	local maximum = math.min(maxMatch, #value - position + 1)
+	for i = #list, 1, -1 do
+		local candidate = list[i]
+		local distance = position - candidate
+		if distance > window then break end
+		checked += 1
+		if checked > depth then break end
+		local length = 0
+		while length < maximum do
+			local source = candidate + (length % distance)
+			if string.byte(value, source) ~= string.byte(value, position + length) then break end
+			length += 1
+		end
+		if length > bestLength then
+			bestLength = length
+			bestDistance = distance
+			if length == maximum then break end
+		end
+	end
+	if bestLength < 3 or bestLength <= 1 + varUIntByteLength(bestDistance) then return 0, 0 end
+	return bestDistance, bestLength
+end
+
+local function repeatedByteRun(value: string, position: number, maximum: number): number
+	local byte = string.byte(value, position)
+	local length = 1
+	local limit = math.min(#value, position + maximum - 1)
+	for i = position + 1, limit do
+		if string.byte(value, i) ~= byte then break end
+		length += 1
+	end
+	return length
+end
+
+local function lzV2Packet(value: string, options: Options?): buffer
+	local searchDepth = math.clamp(options and options.StringSearchDepth or 24, 1, 128)
+	local window = math.clamp(options and options.StringWindowSize or 16383, 32, 65535)
+	local maxMatch = math.clamp(options and options.StringMaxMatch or 66, 3, 66)
+	local body = newWriter(math.max(16, #value))
+	local index: {[string]: {number}} = {}
+	local position = 1
+	local literalStart = 1
+	local literalLength = 0
+
+	local function flushLiteral()
+		if literalLength == 0 then return end
+		writeByte(body, literalLength - 1)
+		ensureCapacity(body, literalLength)
+		buffer.writestring(body.Buffer, body.Position, string.sub(value, literalStart, literalStart + literalLength - 1))
+		body.Position += literalLength
+		body.UsedBits += literalLength * 8
+		literalLength = 0
+	end
+
+	while position <= #value do
+		local runLength = repeatedByteRun(value, position, maxMatch)
+		local distance, matchLength = indexedStringMatch(value, position, index, window, maxMatch, searchDepth)
+		local useRun = runLength >= 3 and runLength >= matchLength
+		local consume = useRun and runLength or matchLength
+		if consume >= 3 then
+			flushLiteral()
+			if useRun then
+				writeByte(body, 128 + runLength - 3)
+				writeByte(body, string.byte(value, position))
+			else
+				writeByte(body, 192 + matchLength - 3)
+				writeVarUInt(body, distance)
+			end
+			for p = position, position + consume - 1 do addStringIndex(index, value, p) end
+			position += consume
+			literalStart = position
+		else
+			if literalLength == 0 then literalStart = position end
+			literalLength += 1
+			addStringIndex(index, value, position)
+			position += 1
+			if literalLength == 128 then flushLiteral(); literalStart = position end
+		end
+	end
+	flushLiteral()
+	local packedBody = finish(body)
+	local w = newWriter(buffer.len(packedBody) + 8)
+	writeByte(w, STR.LZ_V2)
+	writeVarUInt(w, #value)
+	ensureCapacity(w, buffer.len(packedBody))
+	buffer.copy(w.Buffer, w.Position, packedBody, 0, buffer.len(packedBody))
+	w.Position += buffer.len(packedBody)
+	w.UsedBits += buffer.len(packedBody) * 8
+	return finish(w)
+end
+
+local function chooseSmaller(current: buffer, candidate: buffer?): buffer
+	if candidate ~= nil and buffer.len(candidate) < buffer.len(current) then return candidate end
+	return current
+end
+
+function Compression.CompressString(value: string, options: Options?): buffer
+	if typeof(value) ~= "string" then fail("CompressString expects string", 2) end
+	local raw = rawStringPacket(value)
+	if options and options.CompressStrings == false then return raw end
+	local strategy: StringStrategy = options and options.StringStrategy or "Auto"
+	if strategy == "Raw" then return raw end
+	if strategy == "Numeric4" then
+		local candidate = numeric4Packet(value)
+		if candidate == nil then fail("Numeric4 strategy only supports 0-9 + - . e E", 2) end
+		return candidate
+	elseif strategy == "Identifier6" then
+		local candidate = identifier6Packet(value)
+		if candidate == nil then fail("Identifier6 strategy only supports A-Z a-z 0-9 _ -", 2) end
+		return candidate
+	elseif strategy == "ASCII7" then
+		local candidate = ascii7Packet(value)
+		if candidate == nil then fail("ASCII7 strategy only supports ASCII bytes 0-127", 2) end
+		return candidate
+	elseif strategy == "LZ" then
+		return lzV2Packet(value, options)
+	elseif strategy ~= "Auto" then
+		fail("invalid StringStrategy " .. tostring(strategy), 2)
+	end
+
+	local best = raw
+	best = chooseSmaller(best, numeric4Packet(value))
+	best = chooseSmaller(best, identifier6Packet(value))
+	best = chooseSmaller(best, ascii7Packet(value))
+	local minLength = math.max(3, options and options.StringMinLength or 16)
+	if #value >= minLength then best = chooseSmaller(best, lzV2Packet(value, options)) end
+	return best
+end
+
+local function decompressStringLegacyV1(r: Reader): string
 	local originalLength = readVarUInt(r)
 	local compressedLength = readVarUInt(r)
-	if r.Position + compressedLength > r.Length then fail("truncated compressed string", 2) end
+	local compressedEnd = r.Position + compressedLength
+	if compressedEnd > r.Length then fail("truncated compressed string", 2) end
 	local output = table.create(originalLength)
-	while r.Position < r.Length and #output < originalLength do
+	while r.Position < compressedEnd and #output < originalLength do
 		local token = readByte(r)
 		if token == 0 then
 			local count = readByte(r)
+			if count < 1 or r.Position + count > compressedEnd or #output + count > originalLength then fail("invalid legacy literal run", 2) end
 			for _ = 1, count do output[#output + 1] = string.char(readByte(r)) end
 		elseif token == 1 then
+			if r.Position + 2 > compressedEnd then fail("truncated legacy back-reference", 2) end
 			local packed = readByte(r) * 256 + readByte(r)
 			local distance = math.floor(packed / 16) + 1
 			local length = packed % 16 + 3
-			if distance > #output then fail("invalid back-reference", 2) end
+			if distance > #output or #output + length > originalLength then fail("invalid legacy back-reference", 2) end
 			for _ = 1, length do
 				local index = #output - distance + 1
 				output[#output + 1] = output[index]
 			end
 		else
-			fail("invalid compressed string token", 2)
+			fail("invalid legacy compressed string token", 2)
 		end
 	end
-	local result = table.concat(output)
-	if #result ~= originalLength then fail("decompressed string length mismatch", 2) end
+	if r.Position ~= compressedEnd or #output ~= originalLength then fail("legacy decompressed string length mismatch", 2) end
+	return table.concat(output)
+end
+
+function Compression.DecompressString(data: buffer): string
+	if typeof(data) ~= "buffer" then fail("DecompressString expects buffer", 2) end
+	if buffer.len(data) == 0 then return "" end
+	local first = buffer.readu8(data, 0)
+	if first > STR.RAW_V3 then
+		return buffer.readstring(data, 0, buffer.len(data))
+	end
+	local r = newReader(data)
+	local mode = readByte(r)
+	if mode == STR.RAW_V3 then
+		local length = r.Length - r.Position
+		local value = length > 0 and buffer.readstring(r.Buffer, r.Position, length) or ""
+		r.Position = r.Length
+		return value
+	elseif mode == STR.RAW then
+		local value = readStringRaw(r)
+		if r.Position ~= r.Length then fail("trailing bytes in raw string payload", 2) end
+		return value
+	elseif mode == STR.LZ_V1 then
+		local value = decompressStringLegacyV1(r)
+		if r.Position ~= r.Length then fail("trailing bytes in legacy string payload", 2) end
+		return value
+	elseif mode == STR.NUMERIC4 then
+		local output = {}
+		local terminated = false
+		while r.Position < r.Length do
+			local packed = readByte(r)
+			local low = packed % 16
+			local high = math.floor(packed / 16)
+			if low == 15 then terminated = true; if high ~= 15 then fail("invalid Numeric4 terminator", 2) end; break end
+			output[#output + 1] = NUMERIC4_DECODE[low + 1]
+			if high == 15 then terminated = true; break end
+			output[#output + 1] = NUMERIC4_DECODE[high + 1]
+		end
+		if not terminated or r.Position ~= r.Length then fail("invalid Numeric4 payload", 2) end
+		return table.concat(output)
+	elseif mode == STR.IDENTIFIER6 then
+		local length = readVarUInt(r)
+		local output = table.create(length)
+		for i = 1, length do
+			local index = readBits(r, 6) + 1
+			output[i] = string.sub(IDENTIFIER_ALPHABET, index, index)
+		end
+		if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid Identifier6 padding or trailing bytes", 2) end
+		return table.concat(output)
+	elseif mode == STR.ASCII7 then
+		local length = readVarUInt(r)
+		local output = table.create(length)
+		for i = 1, length do output[i] = string.char(readBits(r, 7)) end
+		if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid ASCII7 padding or trailing bytes", 2) end
+		return table.concat(output)
+	elseif mode == STR.LZ_V2 then
+		local originalLength = readVarUInt(r)
+		local output = table.create(originalLength)
+		while #output < originalLength do
+			if r.Position >= r.Length then fail("truncated LZ string payload", 2) end
+			local token = readByte(r)
+			if token < 128 then
+				local count = token + 1
+				if r.Position + count > r.Length or #output + count > originalLength then fail("invalid LZ literal run", 2) end
+				for _ = 1, count do output[#output + 1] = string.char(readByte(r)) end
+			elseif token < 192 then
+				local count = token - 128 + 3
+				if #output + count > originalLength then fail("invalid LZ byte run", 2) end
+				local byte = readByte(r)
+				for _ = 1, count do output[#output + 1] = string.char(byte) end
+			else
+				local length = token - 192 + 3
+				local distance = readVarUInt(r)
+				if distance < 1 or distance > #output or #output + length > originalLength then fail("invalid LZ back-reference", 2) end
+				for _ = 1, length do
+					local index = #output - distance + 1
+					output[#output + 1] = output[index]
+				end
+			end
+		end
+		if r.Position ~= r.Length then fail("trailing bytes in LZ string payload", 2) end
+		return table.concat(output)
+	end
+	fail("invalid compressed string mode", 2)
+	return ""
+end
+
+
+local BUF = {
+	RAW = 0,
+	ZERO = 1,
+	FILL = 2,
+	LZ = 3,
+	SPARSE_ZERO = 4,
+	SPARSE_POWER2 = 5,
+	NIBBLE_LOW = 6,
+	NIBBLE_HIGH = 7,
+	V2_FLAG = 0x80,
+	V2_LENGTH_EXT = 15,
+}
+
+local POWER2_EXPONENT: {[number]: number} = {
+	[1] = 0,
+	[2] = 1,
+	[4] = 2,
+	[8] = 3,
+	[16] = 4,
+	[32] = 5,
+	[64] = 6,
+	[128] = 7,
+}
+
+local function writeBufferV2Header(w: Writer, mode: number, length: number)
+	if mode < 0 or mode > 7 then fail("invalid v2 buffer mode", 2) end
+	if length < 0 or length % 1 ~= 0 then fail("invalid buffer length", 2) end
+	writeByte(w, FMT.COMPACT_BUFFER_MAGIC)
+	local lengthCode = length < BUF.V2_LENGTH_EXT and length or BUF.V2_LENGTH_EXT
+	writeByte(w, BUF.V2_FLAG + mode * 16 + lengthCode)
+	if lengthCode == BUF.V2_LENGTH_EXT then writeVarUInt(w, length) end
+end
+
+local function readBufferHeader(r: Reader): (number, number, boolean)
+	if readByte(r) ~= FMT.COMPACT_BUFFER_MAGIC then fail("invalid compressed buffer header", 2) end
+	local control = readByte(r)
+	if control < BUF.V2_FLAG then
+		if control < BUF.RAW or control > BUF.LZ then fail("invalid legacy compressed buffer mode", 2) end
+		return control, readVarUInt(r), false
+	end
+	local packed = control - BUF.V2_FLAG
+	local mode = math.floor(packed / 16)
+	local lengthCode = packed % 16
+	if mode < BUF.RAW or mode > BUF.NIBBLE_HIGH then fail("invalid v2 compressed buffer mode", 2) end
+	local length = lengthCode
+	if lengthCode == BUF.V2_LENGTH_EXT then length = readVarUInt(r) end
+	return mode, length, true
+end
+
+local function bufferRawPacket(value: buffer): buffer
+	local length = buffer.len(value)
+	local result = buffer.create(length + 1)
+	buffer.writeu8(result, 0, FMT.COMPACT_BUFFER_RAW_MAGIC)
+	if length > 0 then buffer.copy(result, 1, value, 0, length) end
 	return result
+end
+
+local function bufferRawCandidate(value: buffer): buffer
+	local length = buffer.len(value)
+	if length == 0 then return buffer.create(0) end
+	local first = buffer.readu8(value, 0)
+	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then
+		local raw = buffer.create(length)
+		buffer.copy(raw, 0, value, 0, length)
+		return raw
+	end
+	return bufferRawPacket(value)
+end
+
+local function bufferFillPacket(value: buffer): buffer?
+	local length = buffer.len(value)
+	if length == 0 then return nil end
+	local first = buffer.readu8(value, 0)
+	for i = 1, length - 1 do
+		if buffer.readu8(value, i) ~= first then return nil end
+	end
+	local w = newWriter(6)
+	writeBufferV2Header(w, first == 0 and BUF.ZERO or BUF.FILL, length)
+	if first ~= 0 then writeByte(w, first) end
+	return finish(w)
+end
+
+local function makeNonZeroBitmap(value: buffer): (buffer, number)
+	local length = buffer.len(value)
+	local bitmap = buffer.create(math.ceil(length / 8))
+	local count = 0
+	for i = 0, length - 1 do
+		if buffer.readu8(value, i) ~= 0 then
+			local byteIndex = math.floor(i / 8)
+			local bitIndex = i % 8
+			local current = buffer.readu8(bitmap, byteIndex)
+			buffer.writeu8(bitmap, byteIndex, bit32.bor(current, bit32.lshift(1, bitIndex)))
+			count += 1
+		end
+	end
+	return bitmap, count
+end
+
+local function bitmapHas(bitmap: buffer, position: number): boolean
+	local byteIndex = math.floor(position / 8)
+	local bitIndex = position % 8
+	return bit32.band(buffer.readu8(bitmap, byteIndex), bit32.lshift(1, bitIndex)) ~= 0
+end
+
+local function appendRawBuffer(w: Writer, data: buffer)
+	local length = buffer.len(data)
+	flushBits(w)
+	ensureCapacity(w, length)
+	if length > 0 then buffer.copy(w.Buffer, w.Position, data, 0, length) end
+	w.Position += length
+	w.UsedBits += length * 8
+end
+
+local function bufferSparseZeroPacket(value: buffer): buffer?
+	local length = buffer.len(value)
+	if length == 0 then return nil end
+	local bitmap, nonZeroCount = makeNonZeroBitmap(value)
+	if nonZeroCount == 0 or nonZeroCount == length then return nil end
+
+	local w = newWriter(4 + buffer.len(bitmap) + nonZeroCount)
+	writeBufferV2Header(w, BUF.SPARSE_ZERO, length)
+	appendRawBuffer(w, bitmap)
+	for i = 0, length - 1 do
+		local byte = buffer.readu8(value, i)
+		if byte ~= 0 then writeByte(w, byte) end
+	end
+	return finish(w)
+end
+
+local function bufferSparsePower2Packet(value: buffer): buffer?
+	local length = buffer.len(value)
+	if length == 0 then return nil end
+
+	local bitmap, nonZeroCount = makeNonZeroBitmap(value)
+	if nonZeroCount == 0 then return nil end
+
+	for i = 0, length - 1 do
+		local byte = buffer.readu8(value, i)
+		if byte ~= 0 and POWER2_EXPONENT[byte] == nil then return nil end
+	end
+
+	local w = newWriter(8 + buffer.len(bitmap) + nonZeroCount)
+
+	if length <= 14 and nonZeroCount <= 7 then
+		writeBufferV2Header(w, BUF.SPARSE_POWER2, length)
+		for i = 0, length - 1 do
+			local byte = buffer.readu8(value, i)
+			if byte ~= 0 then
+				writeBits(w, i, 4)
+				writeBits(w, POWER2_EXPONENT[byte] :: number, 3)
+			end
+		end
+		return finish(w)
+	end
+
+	writeBufferV2Header(w, BUF.SPARSE_POWER2, length)
+	appendRawBuffer(w, bitmap)
+	for i = 0, length - 1 do
+		local byte = buffer.readu8(value, i)
+		if byte ~= 0 then writeBits(w, POWER2_EXPONENT[byte] :: number, 3) end
+	end
+	return finish(w)
+end
+
+local function bufferNibblePacket(value: buffer, high: boolean): buffer?
+	local length = buffer.len(value)
+	if length == 0 then return nil end
+
+	for i = 0, length - 1 do
+		local byte = buffer.readu8(value, i)
+		if high then
+			if byte % 16 ~= 0 then return nil end
+		elseif byte > 15 then
+			return nil
+		end
+	end
+
+	local mode = high and BUF.NIBBLE_HIGH or BUF.NIBBLE_LOW
+	local w = newWriter(4 + math.ceil(length / 2))
+	writeBufferV2Header(w, mode, length)
+
+	local position = 0
+	while position < length do
+		local a = buffer.readu8(value, position)
+		if high then a = math.floor(a / 16) end
+		local b = 0
+		if position + 1 < length then
+			b = buffer.readu8(value, position + 1)
+			if high then b = math.floor(b / 16) end
+		end
+		writeByte(w, a + b * 16)
+		position += 2
+	end
+
+	return finish(w)
+end
+
+local function bufferIndexKey(value: buffer, position: number): number?
+	if position + 2 >= buffer.len(value) then return nil end
+	return buffer.readu8(value, position)
+		+ buffer.readu8(value, position + 1) * 256
+		+ buffer.readu8(value, position + 2) * 65536
+end
+
+local function addBufferIndex(index: {[number]: {number}}, value: buffer, position: number)
+	local key = bufferIndexKey(value, position)
+	if key == nil then return end
+	local list = index[key]
+	if list == nil then list = {}; index[key] = list end
+	list[#list + 1] = position
+end
+
+local function indexedBufferMatch(value: buffer, position: number, index: {[number]: {number}}, window: number, maxMatch: number, depth: number): (number, number)
+	local key = bufferIndexKey(value, position)
+	if key == nil then return 0, 0 end
+	local list = index[key]
+	if list == nil then return 0, 0 end
+	local bestDistance = 0
+	local bestLength = 0
+	local checked = 0
+	local maximum = math.min(maxMatch, buffer.len(value) - position)
+	for i = #list, 1, -1 do
+		local candidate = list[i]
+		local distance = position - candidate
+		if distance > window then break end
+		checked += 1
+		if checked > depth then break end
+		local length = 0
+		while length < maximum do
+			local source = candidate + (length % distance)
+			if buffer.readu8(value, source) ~= buffer.readu8(value, position + length) then break end
+			length += 1
+		end
+		if length > bestLength then
+			bestLength = length
+			bestDistance = distance
+			if length == maximum then break end
+		end
+	end
+	if bestLength < 3 or bestLength <= 1 + varUIntByteLength(bestDistance) then return 0, 0 end
+	return bestDistance, bestLength
+end
+
+local function repeatedBufferByteRun(value: buffer, position: number, maximum: number): number
+	local lengthTotal = buffer.len(value)
+	if position >= lengthTotal then return 0 end
+	local byte = buffer.readu8(value, position)
+	local length = 1
+	local limit = math.min(lengthTotal, position + maximum)
+	for i = position + 1, limit - 1 do
+		if buffer.readu8(value, i) ~= byte then break end
+		length += 1
+	end
+	return length
+end
+
+local function bufferLZPacket(value: buffer, options: Options?): buffer
+	local searchDepth = math.clamp(options and options.BufferSearchDepth or 32, 1, 192)
+	local window = math.clamp(options and options.BufferWindowSize or 32767, 32, 65535)
+	local maxMatch = math.clamp(options and options.BufferMaxMatch or 66, 3, 66)
+	local lengthTotal = buffer.len(value)
+	local body = newWriter(math.max(16, lengthTotal))
+	local index: {[number]: {number}} = {}
+	local position = 0
+	local literalStart = 0
+	local literalLength = 0
+
+	local function flushLiteral()
+		if literalLength == 0 then return end
+		writeByte(body, literalLength - 1)
+		ensureCapacity(body, literalLength)
+		buffer.copy(body.Buffer, body.Position, value, literalStart, literalLength)
+		body.Position += literalLength
+		body.UsedBits += literalLength * 8
+		literalLength = 0
+	end
+
+	while position < lengthTotal do
+		local runLength = repeatedBufferByteRun(value, position, maxMatch)
+		local distance, matchLength = indexedBufferMatch(value, position, index, window, maxMatch, searchDepth)
+		local useRun = runLength >= 3 and runLength >= matchLength
+		local consume = useRun and runLength or matchLength
+		if consume >= 3 then
+			flushLiteral()
+			if useRun then
+				writeByte(body, 128 + runLength - 3)
+				writeByte(body, buffer.readu8(value, position))
+			else
+				writeByte(body, 192 + matchLength - 3)
+				writeVarUInt(body, distance)
+			end
+			for p = position, position + consume - 1 do addBufferIndex(index, value, p) end
+			position += consume
+			literalStart = position
+		else
+			if literalLength == 0 then literalStart = position end
+			literalLength += 1
+			addBufferIndex(index, value, position)
+			position += 1
+			if literalLength == 128 then flushLiteral(); literalStart = position end
+		end
+	end
+
+	flushLiteral()
+	local packedBody = finish(body)
+	local w = newWriter(buffer.len(packedBody) + 4)
+	writeBufferV2Header(w, BUF.LZ, lengthTotal)
+	appendRawBuffer(w, packedBody)
+	return finish(w)
+end
+
+local function bestSparseBuffer(value: buffer, raw: buffer): buffer
+	local best = raw
+	best = chooseSmaller(best, bufferSparsePower2Packet(value))
+	best = chooseSmaller(best, bufferSparseZeroPacket(value))
+	return best
+end
+
+local function bestNibbleBuffer(value: buffer, raw: buffer): buffer
+	local best = raw
+	best = chooseSmaller(best, bufferNibblePacket(value, false))
+	best = chooseSmaller(best, bufferNibblePacket(value, true))
+	return best
+end
+
+function Compression.CompressBuffer(value: buffer, options: Options?): buffer
+	if typeof(value) ~= "buffer" then fail("CompressBuffer expects buffer", 2) end
+	local raw = bufferRawCandidate(value)
+	if options and options.CompressBuffers == false then return raw end
+
+	local strategy: BufferStrategy = options and options.BufferStrategy or "Auto"
+	if strategy == "Raw" then return raw end
+	if strategy == "LZ" then return bufferLZPacket(value, options) end
+	if strategy == "Sparse" then return bestSparseBuffer(value, raw) end
+	if strategy == "Nibble" then return bestNibbleBuffer(value, raw) end
+	if strategy ~= "Auto" then fail("invalid BufferStrategy " .. tostring(strategy), 2) end
+
+	local best = raw
+	best = chooseSmaller(best, bufferFillPacket(value))
+	best = chooseSmaller(best, bufferSparsePower2Packet(value))
+	best = chooseSmaller(best, bufferSparseZeroPacket(value))
+	best = chooseSmaller(best, bufferNibblePacket(value, false))
+	best = chooseSmaller(best, bufferNibblePacket(value, true))
+
+	local minimum = math.max(3, options and options.BufferMinLength or 6)
+	if buffer.len(value) >= minimum then
+		best = chooseSmaller(best, bufferLZPacket(value, options))
+	end
+
+	return best
+end
+
+local function decompressLZBufferBody(r: Reader, originalLength: number): buffer
+	local result = buffer.create(originalLength)
+	local outputPosition = 0
+
+	while outputPosition < originalLength do
+		if r.Position >= r.Length then fail("truncated LZ buffer payload", 2) end
+		local token = readByte(r)
+		if token < 128 then
+			local count = token + 1
+			if r.Position + count > r.Length or outputPosition + count > originalLength then fail("invalid LZ buffer literal", 2) end
+			buffer.copy(result, outputPosition, r.Buffer, r.Position, count)
+			r.Position += count
+			outputPosition += count
+		elseif token < 192 then
+			local count = token - 128 + 3
+			if r.Position >= r.Length or outputPosition + count > originalLength then fail("invalid LZ buffer run", 2) end
+			local byte = readByte(r)
+			buffer.fill(result, outputPosition, byte, count)
+			outputPosition += count
+		else
+			local length = token - 192 + 3
+			local distance = readVarUInt(r)
+			if distance < 1 or distance > outputPosition or outputPosition + length > originalLength then fail("invalid LZ buffer back-reference", 2) end
+			for _ = 1, length do
+				local byte = buffer.readu8(result, outputPosition - distance)
+				buffer.writeu8(result, outputPosition, byte)
+				outputPosition += 1
+			end
+		end
+	end
+
+	if r.Position ~= r.Length then fail("trailing bytes in LZ buffer payload", 2) end
+	return result
+end
+
+local function decompressSparseZero(r: Reader, originalLength: number): buffer
+	local bitmapBytes = math.ceil(originalLength / 8)
+	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-zero bitmap", 2) end
+
+	local bitmap = buffer.create(bitmapBytes)
+	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
+	r.Position += bitmapBytes
+
+	local result = buffer.create(originalLength)
+	for i = 0, originalLength - 1 do
+		if bitmapHas(bitmap, i) then
+			if r.Position >= r.Length then fail("truncated sparse-zero values", 2) end
+			buffer.writeu8(result, i, readByte(r))
+		end
+	end
+
+	if r.Position ~= r.Length then fail("trailing bytes in sparse-zero buffer payload", 2) end
+	return result
+end
+
+local function decompressSparsePower2(r: Reader, originalLength: number): buffer
+	local result = buffer.create(originalLength)
+
+	if originalLength <= 14 then
+		local payloadBytes = r.Length - r.Position
+		if payloadBytes < 1 or payloadBytes > 7 then fail("invalid compact sparse-power2 payload", 2) end
+		local count = payloadBytes
+		local previousPosition = -1
+		for _ = 1, count do
+			local position = readBits(r, 4)
+			local exponent = readBits(r, 3)
+			if position >= originalLength or position <= previousPosition then fail("invalid sparse-power2 position", 2) end
+			buffer.writeu8(result, position, 2 ^ exponent)
+			previousPosition = position
+		end
+		if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid sparse-power2 padding or trailing bytes", 2) end
+		return result
+	end
+
+	local bitmapBytes = math.ceil(originalLength / 8)
+	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-power2 bitmap", 2) end
+	local bitmap = buffer.create(bitmapBytes)
+	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
+	r.Position += bitmapBytes
+
+	for i = 0, originalLength - 1 do
+		if bitmapHas(bitmap, i) then
+			local exponent = readBits(r, 3)
+			buffer.writeu8(result, i, 2 ^ exponent)
+		end
+	end
+
+	if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid sparse-power2 padding or trailing bytes", 2) end
+	return result
+end
+
+local function decompressNibbleBuffer(r: Reader, originalLength: number, high: boolean): buffer
+	local packedBytes = math.ceil(originalLength / 2)
+	if r.Position + packedBytes ~= r.Length then fail("nibble buffer length mismatch", 2) end
+	local result = buffer.create(originalLength)
+	local outputPosition = 0
+
+	while outputPosition < originalLength do
+		local packed = readByte(r)
+		local a = packed % 16
+		local b = math.floor(packed / 16)
+		if high then
+			a *= 16
+			b *= 16
+		end
+		buffer.writeu8(result, outputPosition, a)
+		outputPosition += 1
+		if outputPosition < originalLength then
+			buffer.writeu8(result, outputPosition, b)
+			outputPosition += 1
+		elseif b ~= 0 then
+			fail("invalid nibble buffer padding", 2)
+		end
+	end
+
+	return result
+end
+
+function Compression.DecompressBuffer(data: buffer): buffer
+	if typeof(data) ~= "buffer" then fail("DecompressBuffer expects buffer", 2) end
+	if buffer.len(data) == 0 then return buffer.create(0) end
+	local first = buffer.readu8(data, 0)
+	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then
+		local raw = buffer.create(buffer.len(data))
+		buffer.copy(raw, 0, data, 0, buffer.len(data))
+		return raw
+	end
+	if first == FMT.COMPACT_BUFFER_RAW_MAGIC then
+		local length = buffer.len(data) - 1
+		local result = buffer.create(length)
+		if length > 0 then buffer.copy(result, 0, data, 1, length) end
+		return result
+	end
+	if buffer.len(data) < 2 then fail("truncated compressed buffer", 2) end
+
+	local r = newReader(data)
+	local mode, originalLength, isV2 = readBufferHeader(r)
+
+	if mode == BUF.RAW then
+		if r.Position + originalLength ~= r.Length then fail("raw buffer length mismatch", 2) end
+		local result = buffer.create(originalLength)
+		if originalLength > 0 then buffer.copy(result, 0, r.Buffer, r.Position, originalLength) end
+		return result
+	elseif mode == BUF.ZERO then
+		if r.Position ~= r.Length then fail("trailing bytes in zero buffer payload", 2) end
+		return buffer.create(originalLength)
+	elseif mode == BUF.FILL then
+		if r.Position + 1 ~= r.Length then fail("invalid fill buffer payload", 2) end
+		local result = buffer.create(originalLength)
+		local byte = readByte(r)
+		if originalLength > 0 then buffer.fill(result, 0, byte, originalLength) end
+		return result
+	elseif mode == BUF.LZ then
+		return decompressLZBufferBody(r, originalLength)
+	end
+
+	if not isV2 then fail("legacy buffer cannot use v2 mode", 2) end
+
+	if mode == BUF.SPARSE_ZERO then
+		return decompressSparseZero(r, originalLength)
+	elseif mode == BUF.SPARSE_POWER2 then
+		return decompressSparsePower2(r, originalLength)
+	elseif mode == BUF.NIBBLE_LOW then
+		return decompressNibbleBuffer(r, originalLength, false)
+	elseif mode == BUF.NIBBLE_HIGH then
+		return decompressNibbleBuffer(r, originalLength, true)
+	end
+
+	fail("invalid compressed buffer mode", 2)
+	return buffer.create(0)
+end
+
+function Compression.BufferMode(data: buffer): string
+	if typeof(data) ~= "buffer" then return "Invalid" end
+	if buffer.len(data) == 0 then return "RawPassthrough" end
+	local first = buffer.readu8(data, 0)
+	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then return "RawPassthrough" end
+	if first == FMT.COMPACT_BUFFER_RAW_MAGIC then return "Raw" end
+	if buffer.len(data) < 2 then return "Invalid" end
+	local control = buffer.readu8(data, 1)
+	local mode = control
+	if control >= BUF.V2_FLAG then
+		mode = math.floor((control - BUF.V2_FLAG) / 16)
+	end
+	if mode == BUF.RAW then return "Raw" end
+	if mode == BUF.ZERO then return "Zero" end
+	if mode == BUF.FILL then return "Fill" end
+	if mode == BUF.LZ then return "LZ" end
+	if mode == BUF.SPARSE_ZERO then return "SparseZero" end
+	if mode == BUF.SPARSE_POWER2 then return "SparsePower2" end
+	if mode == BUF.NIBBLE_LOW then return "Nibble4" end
+	if mode == BUF.NIBBLE_HIGH then return "NibbleHigh4" end
+	return "Unknown"
+end
+
+function Compression.BufferFrameVersion(data: buffer): number?
+	if typeof(data) ~= "buffer" then return nil end
+	if buffer.len(data) == 0 then return 0 end
+	local first = buffer.readu8(data, 0)
+	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then return 0 end
+	if first == FMT.COMPACT_BUFFER_RAW_MAGIC then return 3 end
+	if buffer.len(data) < 2 then return nil end
+	return buffer.readu8(data, 1) >= BUF.V2_FLAG and 2 or 1
+end
+
+function Compression.BufferStats(value: buffer, options: Options?): {[string]: any}
+	if typeof(value) ~= "buffer" then fail("BufferStats expects buffer", 2) end
+	local data = Compression.CompressBuffer(value, options)
+	local rawBytes = buffer.len(value)
+	local bytes = buffer.len(data)
+	local delta = rawBytes - bytes
+	local saved = math.max(0, delta)
+	local expanded = math.max(0, -delta)
+	return {
+		Mode = Compression.BufferMode(data),
+		FrameVersion = Compression.BufferFrameVersion(data),
+		Bytes = bytes,
+		Bits = bytes * 8,
+		RawBytes = rawBytes,
+		SavedBytes = saved,
+		ExpandedBytes = expanded,
+		ByteDelta = delta,
+		SavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
+		ExpansionPercent = rawBytes > 0 and math.max(0, -delta / rawBytes * 100) or 0,
+		Ratio = rawBytes > 0 and bytes / rawBytes or 1,
+		IsSmaller = bytes < rawBytes,
+		Data = data,
+	}
+end
+
+function Compression.PrintBufferStats(value: buffer, options: Options?): {[string]: any}
+	local stats = Compression.BufferStats(value, options)
+	print("========== Compression v2.2.1 Buffer Stats ==========")
+	print("Mode:", stats.Mode, "| Frame:", "v" .. tostring(stats.FrameVersion or "?"))
+	print("Raw:", Compression.FormatBytes(stats.RawBytes))
+	print("Encoded:", Compression.FormatBytes(stats.Bytes))
+	if stats.ExpandedBytes > 0 then
+		print("Expanded:", Compression.FormatBytes(stats.ExpandedBytes))
+		print(string.format("Expansion: %.2f%%", stats.ExpansionPercent))
+	else
+		print("Saved:", Compression.FormatBytes(stats.SavedBytes))
+		print(string.format("Savings: %.2f%%", stats.SavingsPercent))
+	end
+	print(string.format("Ratio: %.4fx", stats.Ratio))
+	print("======================================================")
+	return stats
+end
+
+function Compression.TryDecompressBuffer(data: buffer): (boolean, buffer?)
+	local ok, result = pcall(Compression.DecompressBuffer, data)
+	if ok then return true, result end
+	return false, nil
+end
+
+function Compression.CompressBufferSmart(value: buffer, options: Options?): (buffer, boolean)
+	if typeof(value) ~= "buffer" then fail("CompressBufferSmart expects buffer", 2) end
+	local packed = Compression.CompressBuffer(value, options)
+	if buffer.len(packed) < buffer.len(value) then return packed, true end
+	local raw = buffer.create(buffer.len(value))
+	if buffer.len(value) > 0 then buffer.copy(raw, 0, value, 0, buffer.len(value)) end
+	return raw, false
+end
+
+function Compression.DecompressBufferSmart(data: buffer, compressed: boolean): buffer
+	if typeof(data) ~= "buffer" then fail("DecompressBufferSmart expects buffer", 2) end
+	if compressed then return Compression.DecompressBuffer(data) end
+	local raw = buffer.create(buffer.len(data))
+	if buffer.len(data) > 0 then buffer.copy(raw, 0, data, 0, buffer.len(data)) end
+	return raw
 end
 
 local function quantize(value: number, minimum: number, maximum: number, bits: number): number
@@ -501,13 +1522,15 @@ local function validate(descriptor: Descriptor, value: any, path: string)
 	local kind = descriptor.Kind
 	local actual = typeof(value)
 	if kind == "Bool" and actual ~= "boolean" then fail(path .. " expected boolean", 3)
-	elseif kind == "UInt" and (actual ~= "number" or value < 0 or not isInteger(value)) then fail(path .. " expected unsigned integer", 3)
-	elseif kind == "Int" and (actual ~= "number" or not isInteger(value)) then fail(path .. " expected integer", 3)
+	elseif kind == "UInt" and (actual ~= "number" or not isSafeUInt(value)) then fail(path .. " expected safe unsigned integer", 3)
+	elseif kind == "Int" and (actual ~= "number" or not isSafeInt(value)) then fail(path .. " expected safe signed integer", 3)
 	elseif (kind == "Float" or kind == "Quantized") and actual ~= "number" then fail(path .. " expected number", 3)
 	elseif (kind == "String" or kind == "CompressedString") and actual ~= "string" then fail(path .. " expected string", 3)
+	elseif kind == "Buffer" and actual ~= "buffer" then fail(path .. " expected buffer", 3)
 	elseif kind == "Vector2" and actual ~= "Vector2" then fail(path .. " expected Vector2", 3)
 	elseif (kind == "Vector3" or kind == "QuantizedVector3") and actual ~= "Vector3" then fail(path .. " expected Vector3", 3)
 	elseif kind == "Color3" and actual ~= "Color3" then fail(path .. " expected Color3", 3)
+	elseif kind == "CFrame" and actual ~= "CFrame" then fail(path .. " expected CFrame", 3)
 	elseif kind == "Array" then
 		if actual ~= "table" or not isArray(value) then fail(path .. " expected array", 3) end
 		for i, item in ipairs(value) do validate(descriptor.Item :: Descriptor, item, path .. "[" .. tostring(i) .. "]") end
@@ -533,6 +1556,14 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 		buffer.copy(w.Buffer, w.Position, compressed, 0, buffer.len(compressed))
 		w.Position += buffer.len(compressed)
 		w.UsedBits += buffer.len(compressed) * 8
+	elseif kind == "Buffer" then
+		local compressed = Compression.CompressBuffer(value, o)
+		writeVarUInt(w, buffer.len(compressed))
+		flushBits(w)
+		ensureCapacity(w, buffer.len(compressed))
+		buffer.copy(w.Buffer, w.Position, compressed, 0, buffer.len(compressed))
+		w.Position += buffer.len(compressed)
+		w.UsedBits += buffer.len(compressed) * 8
 	elseif kind == "Vector2" then writeF64(w, value.X); writeF64(w, value.Y)
 	elseif kind == "Vector3" then writeF64(w, value.X); writeF64(w, value.Y); writeF64(w, value.Z)
 	elseif kind == "Color3" then
@@ -540,6 +1571,9 @@ local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 		writeByte(w, math.floor(value.R * 255 + 0.5))
 		writeByte(w, math.floor(value.G * 255 + 0.5))
 		writeByte(w, math.floor(value.B * 255 + 0.5))
+	elseif kind == "CFrame" then
+		local components = {value:GetComponents()}
+		for i = 1, 12 do writeF64(w, components[i]) end
 	elseif kind == "Quantized" then writeBits(w, quantize(value, o.Minimum, o.Maximum, o.Bits), o.Bits)
 	elseif kind == "QuantizedVector3" then
 		writeBits(w, quantize(value.X, o.Minimum.X, o.Maximum.X, o.Bits), o.Bits)
@@ -577,9 +1611,21 @@ local function readDescriptor(r: Reader, descriptor: Descriptor): any
 		buffer.copy(slice, 0, r.Buffer, r.Position, length)
 		r.Position += length
 		return Compression.DecompressString(slice)
+	elseif kind == "Buffer" then
+		local length = readVarUInt(r)
+		alignReader(r)
+		if r.Position + length > r.Length then fail("truncated compressed buffer", 2) end
+		local slice = buffer.create(length)
+		buffer.copy(slice, 0, r.Buffer, r.Position, length)
+		r.Position += length
+		return Compression.DecompressBuffer(slice)
 	elseif kind == "Vector2" then return Vector2.new(readF64(r), readF64(r))
 	elseif kind == "Vector3" then return Vector3.new(readF64(r), readF64(r), readF64(r))
 	elseif kind == "Color3" then alignReader(r); return Color3.fromRGB(readByte(r), readByte(r), readByte(r))
+	elseif kind == "CFrame" then
+		local components = table.create(12)
+		for i = 1, 12 do components[i] = readF64(r) end
+		return CFrame.new(table.unpack(components))
 	elseif kind == "Quantized" then return dequantize(readBits(r, o.Bits), o.Minimum, o.Maximum, o.Bits)
 	elseif kind == "QuantizedVector3" then
 		return Vector3.new(
@@ -610,25 +1656,63 @@ local function readDescriptor(r: Reader, descriptor: Descriptor): any
 end
 
 local function writeHeader(w: Writer, mode: number, schemaVersion: number?)
-	writeByte(w, MAGIC_A)
-	writeByte(w, MAGIC_B)
-	writeByte(w, VERSION)
+	writeByte(w, FMT.MAGIC_A)
+	writeByte(w, FMT.MAGIC_B)
+	writeByte(w, FMT.VERSION)
 	writeByte(w, mode)
 	writeVarUInt(w, schemaVersion or 1)
 end
 
-local function readHeader(r: Reader, expectedMode: number): number
-	if readByte(r) ~= MAGIC_A or readByte(r) ~= MAGIC_B then fail("invalid binary header", 2) end
-	if readByte(r) ~= VERSION then fail("unsupported binary version", 2) end
+local function readHeader(r: Reader, expectedMode: number): (number, number)
+	if readByte(r) ~= FMT.MAGIC_A or readByte(r) ~= FMT.MAGIC_B then fail("invalid binary header", 2) end
+	local binaryVersion = readByte(r)
+	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
+	r.LegacyVarUInt = binaryVersion == 6
 	if readByte(r) ~= expectedMode then fail("unexpected binary mode", 2) end
-	return readVarUInt(r)
+	return readVarUInt(r), binaryVersion
 end
 
-local function packetFromBuffer(data: buffer, options: Options?, schemaVersion: number?): Packet
+local function packetFromBuffer(data: buffer, options: Options?, schemaVersion: number?, rawBits: number?): Packet
 	local mode = options and options.Mode or "Binary"
 	local hash = nil
 	if mode == "BinaryWithHash" then hash = hashBuffer(data) end
-	return {Data = data, Hash = hash, Bytes = buffer.len(data), Bits = buffer.len(data) * 8, SchemaVersion = schemaVersion}
+	local bytes = buffer.len(data)
+	local rawBytes = rawBits and math.ceil(rawBits / 8) or nil
+	local byteDelta = rawBytes and (rawBytes - bytes) or nil
+	local savedBytes = byteDelta and math.max(0, byteDelta) or nil
+	local expandedBytes = byteDelta and math.max(0, -byteDelta) or nil
+	local savingsPercent = rawBytes and rawBytes > 0 and math.max(0, (byteDelta :: number) / rawBytes * 100) or 0
+	local ratio = rawBytes and rawBytes > 0 and bytes / rawBytes or nil
+	return {
+		Data = data,
+		Hash = hash,
+		Bytes = bytes,
+		Bits = bytes * 8,
+		UsefulBits = bytes * 8,
+		PhysicalBits = bytes * 8,
+		SchemaVersion = schemaVersion,
+		RawBytes = rawBytes,
+		SavedBytes = savedBytes,
+		ExpandedBytes = expandedBytes,
+		ByteDelta = byteDelta,
+		SavingsPercent = savingsPercent,
+		Ratio = ratio,
+	}
+end
+
+local function markBooleanPacket(packet: Packet): Packet
+	local rawBits = 8
+	local usefulBits = 1
+	local physicalBits = packet.Bytes * 8
+	packet.Bits = usefulBits
+	packet.UsefulBits = usefulBits
+	packet.PhysicalBits = physicalBits
+	packet.SavedBits = rawBits - usefulBits
+	packet.ExpandedBits = 0
+	packet.BitSavingsPercent = (rawBits - usefulBits) / rawBits * 100
+	packet.SavingsPercent = packet.BitSavingsPercent
+	packet.Ratio = usefulBits / rawBits
+	return packet
 end
 
 local function unwrapPacket(packet: Packet | buffer, options: Options?): (buffer, number?)
@@ -650,12 +1734,89 @@ local function rawValueBits(value: any): number
 	elseif kind == "Vector3" then return 192
 	elseif kind == "Color3" then return 96
 	elseif kind == "CFrame" then return 768
+	elseif kind == "buffer" then return buffer.len(value) * 8
 	elseif kind == "table" then
 		local bits = 0
 		for key, child in pairs(value) do bits += rawValueBits(key); bits += rawValueBits(child) end
 		return bits
 	end
 	return 0
+end
+
+local function cloneBuffer(value: buffer): buffer
+	local length = buffer.len(value)
+	local result = buffer.create(length)
+	if length > 0 then buffer.copy(result, 0, value, 0, length) end
+	return result
+end
+
+local function rawAutoData(value: any): (buffer?, string?)
+	local kind = typeof(value)
+
+	if kind == "nil" then
+		return buffer.create(0), "PassthroughNil"
+	elseif kind == "number" then
+		local data = buffer.create(8)
+		buffer.writef64(data, 0, value)
+		return data, "PassthroughNumber"
+	elseif kind == "string" then
+		local data = buffer.create(#value)
+		if #value > 0 then buffer.writestring(data, 0, value) end
+		return data, "PassthroughString"
+	elseif kind == "buffer" then
+		return cloneBuffer(value), "PassthroughBuffer"
+	elseif kind == "Vector2" then
+		local data = buffer.create(16)
+		buffer.writef64(data, 0, value.X)
+		buffer.writef64(data, 8, value.Y)
+		return data, "PassthroughVector2"
+	elseif kind == "Vector3" then
+		local data = buffer.create(24)
+		buffer.writef64(data, 0, value.X)
+		buffer.writef64(data, 8, value.Y)
+		buffer.writef64(data, 16, value.Z)
+		return data, "PassthroughVector3"
+	elseif kind == "CFrame" then
+		local data = buffer.create(96)
+		local components = {value:GetComponents()}
+		for i = 1, 12 do buffer.writef64(data, (i - 1) * 8, components[i]) end
+		return data, "PassthroughCFrame"
+	end
+
+	return nil, nil
+end
+
+local function decodePassthroughPacket(packet: Packet): (boolean, any)
+	if packet.Passthrough ~= true then return false, nil end
+	local codec = packet.Codec
+	local data = packet.Data
+	local length = buffer.len(data)
+
+	if codec == "PassthroughNil" then
+		if length ~= 0 then fail("invalid nil passthrough length", 2) end
+		return true, nil
+	elseif codec == "PassthroughNumber" then
+		if length ~= 8 then fail("invalid number passthrough length", 2) end
+		return true, buffer.readf64(data, 0)
+	elseif codec == "PassthroughString" then
+		return true, length > 0 and buffer.readstring(data, 0, length) or ""
+	elseif codec == "PassthroughBuffer" then
+		return true, cloneBuffer(data)
+	elseif codec == "PassthroughVector2" then
+		if length ~= 16 then fail("invalid Vector2 passthrough length", 2) end
+		return true, Vector2.new(buffer.readf64(data, 0), buffer.readf64(data, 8))
+	elseif codec == "PassthroughVector3" then
+		if length ~= 24 then fail("invalid Vector3 passthrough length", 2) end
+		return true, Vector3.new(buffer.readf64(data, 0), buffer.readf64(data, 8), buffer.readf64(data, 16))
+	elseif codec == "PassthroughCFrame" then
+		if length ~= 96 then fail("invalid CFrame passthrough length", 2) end
+		local components = table.create(12)
+		for i = 1, 12 do components[i] = buffer.readf64(data, (i - 1) * 8) end
+		return true, CFrame.new(table.unpack(components))
+	end
+
+	fail("unknown passthrough codec " .. tostring(codec), 2)
+	return false, nil
 end
 
 local Schema = {}
@@ -675,7 +1836,7 @@ end
 
 function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 	local w = newWriter()
-	writeHeader(w, MODE_SCHEMA, self.Version)
+	writeHeader(w, MODE.SCHEMA, self.Version)
 	for _, field in ipairs(self.Fields) do
 		local descriptor = field.Descriptor
 		local fieldValue = value[field.Name]
@@ -684,13 +1845,13 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 		elseif not present then fail("missing required field " .. field.Name, 2) end
 		if present then validate(descriptor, fieldValue, field.Name); writeDescriptor(w, descriptor, fieldValue) end
 	end
-	return packetFromBuffer(finish(w), options, self.Version)
+	return packetFromBuffer(finish(w), options, self.Version, rawValueBits(value))
 end
 
 function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: any}
 	local data, packetVersion = unwrapPacket(packet, options)
 	local r = newReader(data)
-	local encodedVersion = readHeader(r, MODE_SCHEMA)
+	local encodedVersion = readHeader(r, MODE.SCHEMA)
 	if packetVersion ~= nil and packetVersion ~= encodedVersion then fail("packet/schema version mismatch", 2) end
 	if encodedVersion ~= self.Version then fail("schema version mismatch", 2) end
 	local result = {}
@@ -700,12 +1861,14 @@ function Schema:Decode(packet: Packet | buffer, options: Options?): {[string]: a
 		if descriptor.Optional then present = readBits(r, 1) == 1 end
 		if present then result[field.Name] = readDescriptor(r, descriptor) end
 	end
+	alignReader(r)
+	if r.Position ~= r.Length then fail("trailing bytes in schema payload", 2) end
 	return result
 end
 
 function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any}, options: Options?): Packet
 	local w = newWriter()
-	writeHeader(w, MODE_DELTA, self.Version)
+	writeHeader(w, MODE.DELTA, self.Version)
 	for _, field in ipairs(self.Fields) do writeBits(w, deepEqual(previous[field.Name], current[field.Name]) and 0 or 1, 1) end
 	for _, field in ipairs(self.Fields) do
 		if not deepEqual(previous[field.Name], current[field.Name]) then
@@ -714,13 +1877,13 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 			if value ~= nil then validate(field.Descriptor, value, field.Name); writeDescriptor(w, field.Descriptor, value) end
 		end
 	end
-	return packetFromBuffer(finish(w), options, self.Version)
+	return packetFromBuffer(finish(w), options, self.Version, rawValueBits(current))
 end
 
 function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, options: Options?): {[string]: any}
 	local data = unwrapPacket(packet, options)
 	local r = newReader(data)
-	local version = readHeader(r, MODE_DELTA)
+	local version = readHeader(r, MODE.DELTA)
 	if version ~= self.Version then fail("schema version mismatch", 2) end
 	local changed = table.create(#self.Fields)
 	for i = 1, #self.Fields do changed[i] = readBits(r, 1) == 1 end
@@ -731,6 +1894,8 @@ function Schema:DecodeDelta(previous: {[string]: any}, packet: Packet | buffer, 
 			if present then result[field.Name] = readDescriptor(r, field.Descriptor) else result[field.Name] = nil end
 		end
 	end
+	alignReader(r)
+	if r.Position ~= r.Length then fail("trailing bytes in delta payload", 2) end
 	return result
 end
 
@@ -738,7 +1903,7 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 	local w = newWriter()
 	local fields = {}
 	local rawBits = 0
-	writeHeader(w, MODE_SCHEMA, self.Version)
+	writeHeader(w, MODE.SCHEMA, self.Version)
 	local headerBits = w.UsedBits
 	for _, field in ipairs(self.Fields) do
 		local descriptor = field.Descriptor
@@ -753,29 +1918,34 @@ function Schema:AnalyzeBits(value: {[string]: any}): BitLayout
 		local padding = w.PaddingBits - paddingBefore
 		local raw = present and rawValueBits(fieldValue) or 0
 		local physical = useful + padding
-		local saved = raw - physical
+		local delta = raw - physical
+		local saved = math.max(0, delta)
+		local expanded = math.max(0, -delta)
 		rawBits += raw
 		fields[#fields + 1] = {
 			Name = field.Name, Type = descriptor.Kind, Present = present,
 			UsefulBits = useful, PaddingBits = padding, PhysicalBits = physical,
-			RawBits = raw, SavedBits = saved,
-			SavingsPercent = raw > 0 and (saved / raw) * 100 or 0,
+			RawBits = raw, SavedBits = saved, ExpandedBits = expanded,
+			SavingsPercent = raw > 0 and math.max(0, (delta / raw) * 100) or 0,
 		}
 	end
 	local data = finish(w)
 	local physicalBits = buffer.len(data) * 8
-	local savedBits = rawBits - physicalBits
+	local deltaBits = rawBits - physicalBits
+	local savedBits = math.max(0, deltaBits)
+	local expandedBits = math.max(0, -deltaBits)
 	return {
 		HeaderBits = headerBits, UsefulBits = w.UsedBits, PaddingBits = w.PaddingBits,
 		PhysicalBits = physicalBits, PhysicalBytes = buffer.len(data), RawBits = rawBits,
-		SavedBits = savedBits, SavingsPercent = rawBits > 0 and (savedBits / rawBits) * 100 or 0,
+		SavedBits = savedBits, ExpandedBits = expandedBits,
+		SavingsPercent = rawBits > 0 and math.max(0, (deltaBits / rawBits) * 100) or 0,
 		Fields = fields,
 	}
 end
 
 function Schema:PrintBitLayout(value: {[string]: any}): BitLayout
 	local layout = self:AnalyzeBits(value)
-	print("========== Compression v1.5.5 Bit Layout ==========")
+	print("========== Compression v2.2.1 Bit Layout ==========")
 	print("Header bits:", layout.HeaderBits)
 	for _, field in ipairs(layout.Fields) do
 		print(string.format(
@@ -789,28 +1959,932 @@ function Schema:PrintBitLayout(value: {[string]: any}): BitLayout
 	print("Physical:", layout.PhysicalBits, "bits /", layout.PhysicalBytes, "bytes")
 	print("Raw:", layout.RawBits, "bits")
 	print("Saved:", layout.SavedBits, "bits")
+	print("Expanded:", layout.ExpandedBits, "bits")
 	print(string.format("Savings: %.2f%%", layout.SavingsPercent))
 	print("===================================================")
 	return layout
 end
 
+local function writeCompactString(w: Writer, value: string, options: Options?, dictionary: DictionaryState)
+	local id = dictionary.Encode[value]
+	if id then
+		writeVarUInt(w, id * 2 + 1)
+		return
+	end
+	local packed = Compression.CompressString(value, options)
+	writeVarUInt(w, buffer.len(packed) * 2)
+	flushBits(w)
+	ensureCapacity(w, buffer.len(packed))
+	buffer.copy(w.Buffer, w.Position, packed, 0, buffer.len(packed))
+	w.Position += buffer.len(packed)
+	w.UsedBits += buffer.len(packed) * 8
+end
+
+local function readCompactString(r: Reader, dictionary: DictionaryState): string
+	local token = readVarUInt(r)
+	if token % 2 == 1 then
+		local id = (token - 1) / 2
+		local value = dictionary.Decode[id]
+		if value == nil then fail("invalid string dictionary reference", 2) end
+		return value
+	end
+	local length = token / 2
+	if r.Position + length > r.Length then fail("truncated compact string", 2) end
+	local data = buffer.create(length)
+	buffer.copy(data, 0, r.Buffer, r.Position, length)
+	r.Position += length
+	return Compression.DecompressString(data)
+end
+
+local function sortedMapKeys(value: {[any]: any}): {any}
+	local keys = {}
+	for key in pairs(value) do
+		local keyType = typeof(key)
+		if keyType ~= "string" and keyType ~= "number" then fail("map keys must be strings or numbers", 2) end
+		keys[#keys + 1] = key
+	end
+	table.sort(keys, function(a, b)
+		local ta = typeof(a)
+		local tb = typeof(b)
+		if ta ~= tb then return ta < tb end
+		if ta == "number" then return a < b end
+		return a < b
+	end)
+	return keys
+end
+
+local function classifyArray(value: {any}): string
+	local count = #value
+	if count == 0 then return "Mixed" end
+	local firstType = typeof(value[1])
+	if firstType == "boolean" then
+		for i = 2, count do if typeof(value[i]) ~= "boolean" then return "Mixed" end end
+		return "Bool"
+	elseif firstType == "string" then
+		for i = 2, count do if typeof(value[i]) ~= "string" then return "Mixed" end end
+		return "String"
+	elseif firstType == "number" then
+		local allUInt = true
+		local allInt = true
+		for i = 1, count do
+			local item = value[i]
+			if typeof(item) ~= "number" then return "Mixed" end
+			if not isSafeUInt(item) then allUInt = false end
+			if not isSafeInt(item) then allInt = false end
+		end
+		if allUInt then return "UInt" end
+		if allInt then return "Int" end
+		return "Float"
+	end
+	return "Mixed"
+end
+
+local function countScalarRuns(value: {any}): number
+	if #value == 0 then return 0 end
+	local firstType = typeof(value[1])
+	if firstType ~= "boolean" and firstType ~= "number" and firstType ~= "string" then return #value end
+	local runs = 1
+	local previous = value[1]
+	for i = 2, #value do
+		if value[i] ~= previous then
+			runs += 1
+			previous = value[i]
+		end
+	end
+	return runs
+end
+
+local function canUseUIntDelta(value: {any}): boolean
+	if #value < 3 then return false end
+	local normalBytes = varUIntByteLength(value[1])
+	local deltaBytes = normalBytes
+	for i = 2, #value do
+		normalBytes += varUIntByteLength(value[i])
+		local delta = value[i] - value[i - 1]
+		if not isSafeInt(delta) then return false end
+		deltaBytes += varIntByteLength(delta)
+	end
+	return deltaBytes < normalBytes
+end
+
+local function canUseIntDelta(value: {any}): boolean
+	if #value < 3 then return false end
+	local normalBytes = varIntByteLength(value[1])
+	local deltaBytes = normalBytes
+	for i = 2, #value do
+		normalBytes += varIntByteLength(value[i])
+		local delta = value[i] - value[i - 1]
+		if not isSafeInt(delta) then return false end
+		deltaBytes += varIntByteLength(delta)
+	end
+	return deltaBytes < normalBytes
+end
+
+local function power10Exponent(value: number): number?
+	if value == 0 or value ~= value or value == math.huge or value == -math.huge then return nil end
+	local absolute = math.abs(value)
+	local exponent = math.floor(math.log10(absolute) + 0.5)
+	if exponent < -308 or exponent > 308 then return nil end
+	if 10 ^ exponent == absolute then return exponent end
+	return nil
+end
+
+local function decimalCandidate(value: number): (number?, number?)
+	if value ~= value or value == math.huge or value == -math.huge then return nil, nil end
+	local bestInteger: number? = nil
+	local bestScale: number? = nil
+	local bestBytes = math.huge
+
+	for scale = 1, 12 do
+		local factor = 10 ^ scale
+		local scaled = value * factor
+		if scaled == scaled and scaled ~= math.huge and scaled ~= -math.huge and math.abs(scaled) <= MAX_SAFE_ZIGZAG_INTEGER then
+			local integer = math.round(scaled)
+			if integer / factor == value then
+				local bytes = 2 + varIntByteLength(integer)
+				if bytes < bestBytes then
+					bestBytes = bytes
+					bestInteger = integer
+					bestScale = scale
+				end
+			end
+		end
+	end
+
+	return bestInteger, bestScale
+end
+
+local function writeNumberPayload(w: Writer, value: number)
+	if value == 0 then
+		writeByte(w, TAG.ZERO)
+	elseif value == 1 then
+		writeByte(w, TAG.ONE)
+	elseif value == -1 then
+		writeByte(w, TAG.NEG_ONE)
+	else
+		local exponent = power10Exponent(value)
+		if exponent ~= nil then
+			writeByte(w, TAG.POWER10)
+			local sign = value < 0 and 1 or 0
+			writeVarUInt(w, zigzagEncode(exponent) * 2 + sign)
+		elseif isSafeUInt(value) then
+			writeByte(w, TAG.UINT)
+			writeVarUInt(w, value)
+		elseif isSafeInt(value) then
+			writeByte(w, TAG.INT)
+			writeVarInt(w, value)
+		else
+			writeByte(w, TAG.FLOAT)
+			writeF64(w, value)
+		end
+	end
+end
+
+local function readNumberPayload(r: Reader): number
+	alignReader(r)
+	local tag = readByte(r)
+	if tag == TAG.ZERO then return 0 end
+	if tag == TAG.ONE then return 1 end
+	if tag == TAG.NEG_ONE then return -1 end
+	if tag == TAG.UINT then return readVarUInt(r) end
+	if tag == TAG.INT then return readVarInt(r) end
+	if tag == TAG.FLOAT then return readF64(r) end
+	if tag == TAG.POWER10 then
+		local code = readVarUInt(r)
+		local sign = code % 2
+		local exponent = zigzagDecode(math.floor(code / 2))
+		local value = 10 ^ exponent
+		return sign == 1 and -value or value
+	end
+	fail("invalid number payload", 2)
+	return 0
+end
+
+local function writeAtomNumber(w: Writer, value: number)
+	if value == 0 then
+		writeByte(w, ATOM.ZERO)
+	elseif value == 1 then
+		writeByte(w, ATOM.ONE)
+	elseif value == -1 then
+		writeByte(w, ATOM.NEG_ONE)
+	else
+		local exponent = power10Exponent(value)
+		if exponent ~= nil then
+			writeByte(w, ATOM.POWER10)
+			local sign = value < 0 and 1 or 0
+			writeVarUInt(w, zigzagEncode(exponent) * 2 + sign)
+		elseif isSafeUInt(value) then
+			writeByte(w, ATOM.UINT)
+			writeVarUInt(w, value)
+		elseif isSafeInt(value) then
+			writeByte(w, ATOM.INT)
+			writeVarInt(w, value)
+		else
+			local decimalInteger, decimalScale = decimalCandidate(value)
+			local decimalBytes = if decimalInteger ~= nil and decimalScale ~= nil then 2 + varIntByteLength(decimalInteger) else math.huge
+			local float32Bytes = exactFloat32(value) and 5 or math.huge
+
+			if decimalBytes < float32Bytes and decimalBytes < 9 then
+				writeByte(w, ATOM.DECIMAL)
+				writeByte(w, decimalScale :: number)
+				writeVarInt(w, decimalInteger :: number)
+			elseif float32Bytes < 9 then
+				writeByte(w, ATOM.FLOAT32)
+				writeF32(w, value)
+			elseif decimalBytes < 9 then
+				writeByte(w, ATOM.DECIMAL)
+				writeByte(w, decimalScale :: number)
+				writeVarInt(w, decimalInteger :: number)
+			else
+				writeByte(w, ATOM.FLOAT)
+				writeF64(w, value)
+			end
+		end
+	end
+end
+
+local function encodeCompactAtom(value: any, options: Options?): buffer?
+	local kind = typeof(value)
+	local w = newWriter(32)
+
+	if kind == "nil" then
+		writeByte(w, ATOM.NIL)
+	elseif kind == "boolean" then
+		writeByte(w, value and ATOM.TRUE or ATOM.FALSE)
+	elseif kind == "number" then
+		writeAtomNumber(w, value)
+	elseif kind == "string" then
+		writeByte(w, ATOM.STRING)
+		local packed = Compression.CompressString(value, options)
+		ensureCapacity(w, buffer.len(packed))
+		if buffer.len(packed) > 0 then buffer.copy(w.Buffer, w.Position, packed, 0, buffer.len(packed)) end
+		w.Position += buffer.len(packed)
+		w.UsedBits += buffer.len(packed) * 8
+	elseif kind == "Vector2" then
+		writeByte(w, ATOM.VECTOR2)
+		writeNumberPayload(w, value.X)
+		writeNumberPayload(w, value.Y)
+		local normal = finish(w)
+
+		local f = newWriter(9)
+		writeByte(f, ATOM.VECTOR2_F32)
+		writeF32(f, value.X)
+		writeF32(f, value.Y)
+		return chooseSmaller(normal, finish(f))
+	elseif kind == "Vector3" then
+		writeByte(w, ATOM.VECTOR3)
+		writeNumberPayload(w, value.X)
+		writeNumberPayload(w, value.Y)
+		writeNumberPayload(w, value.Z)
+		local normal = finish(w)
+
+		local f = newWriter(13)
+		writeByte(f, ATOM.VECTOR3_F32)
+		writeF32(f, value.X)
+		writeF32(f, value.Y)
+		writeF32(f, value.Z)
+		return chooseSmaller(normal, finish(f))
+	elseif kind == "Color3" then
+		writeByte(w, ATOM.COLOR3)
+		writeByte(w, math.floor(value.R * 255 + 0.5))
+		writeByte(w, math.floor(value.G * 255 + 0.5))
+		writeByte(w, math.floor(value.B * 255 + 0.5))
+	elseif kind == "CFrame" then
+		local components = {value:GetComponents()}
+
+		writeByte(w, ATOM.CFRAME)
+		for i = 1, 12 do writeNumberPayload(w, components[i]) end
+		local normal = finish(w)
+
+		local f = newWriter(49)
+		writeByte(f, ATOM.CFRAME_F32)
+		for i = 1, 12 do writeF32(f, components[i]) end
+		return chooseSmaller(normal, finish(f))
+	else
+		return nil
+	end
+
+	return finish(w)
+end
+
+local function isCompactAtomTag(tag: number): boolean
+	return tag >= ATOM.NIL and tag <= ATOM.CFRAME_F32
+end
+
+local function decodeCompactAtom(data: buffer): (boolean, any)
+	if buffer.len(data) < 1 then return false, nil end
+	local first = buffer.readu8(data, 0)
+	if not isCompactAtomTag(first) then return false, nil end
+
+	local r = newReader(data)
+	local tag = readByte(r)
+	local value: any
+
+	if tag == ATOM.NIL then
+		value = nil
+	elseif tag == ATOM.FALSE then
+		value = false
+	elseif tag == ATOM.TRUE then
+		value = true
+	elseif tag == ATOM.ZERO then
+		value = 0
+	elseif tag == ATOM.ONE then
+		value = 1
+	elseif tag == ATOM.NEG_ONE then
+		value = -1
+	elseif tag == ATOM.UINT then
+		value = readVarUInt(r)
+	elseif tag == ATOM.INT then
+		value = readVarInt(r)
+	elseif tag == ATOM.FLOAT then
+		value = readF64(r)
+	elseif tag == ATOM.FLOAT32 then
+		value = readF32(r)
+	elseif tag == ATOM.DECIMAL then
+		local scale = readByte(r)
+		if scale < 1 or scale > 12 then fail("invalid decimal atom scale", 2) end
+		value = readVarInt(r) / 10 ^ scale
+	elseif tag == ATOM.POWER10 then
+		local code = readVarUInt(r)
+		local sign = code % 2
+		local exponent = zigzagDecode(math.floor(code / 2))
+		local result = 10 ^ exponent
+		value = sign == 1 and -result or result
+	elseif tag == ATOM.STRING then
+		local length = r.Length - r.Position
+		if length < 1 then fail("truncated compact string atom", 2) end
+		local packed = buffer.create(length)
+		buffer.copy(packed, 0, r.Buffer, r.Position, length)
+		r.Position = r.Length
+		value = Compression.DecompressString(packed)
+	elseif tag == ATOM.VECTOR2 then
+		value = Vector2.new(readNumberPayload(r), readNumberPayload(r))
+	elseif tag == ATOM.VECTOR2_F32 then
+		value = Vector2.new(readF32(r), readF32(r))
+	elseif tag == ATOM.VECTOR3 then
+		value = Vector3.new(readNumberPayload(r), readNumberPayload(r), readNumberPayload(r))
+	elseif tag == ATOM.VECTOR3_F32 then
+		value = Vector3.new(readF32(r), readF32(r), readF32(r))
+	elseif tag == ATOM.COLOR3 then
+		value = Color3.fromRGB(readByte(r), readByte(r), readByte(r))
+	elseif tag == ATOM.CFRAME then
+		local components = table.create(12)
+		for i = 1, 12 do components[i] = readNumberPayload(r) end
+		value = CFrame.new(table.unpack(components))
+	elseif tag == ATOM.CFRAME_F32 then
+		local components = table.create(12)
+		for i = 1, 12 do components[i] = readF32(r) end
+		value = CFrame.new(table.unpack(components))
+	else
+		return false, nil
+	end
+
+	alignReader(r)
+	if r.Position ~= r.Length then fail("trailing bytes in compact atom", 2) end
+	return true, value
+end
+
+local CT = {
+	VALUE_NIL = 0x00,
+	VALUE_FALSE = 0x01,
+	VALUE_TRUE = 0x02,
+	VALUE_STRING = 0x03,
+	VALUE_FLOAT = 0x04,
+	VALUE_UINT = 0x05,
+	VALUE_INT = 0x06,
+	VALUE_POWER10 = 0x07,
+	VALUE_VECTOR2 = 0x08,
+	VALUE_VECTOR3 = 0x09,
+	VALUE_COLOR3 = 0x0A,
+	VALUE_CFRAME = 0x0B,
+	VALUE_BUFFER = 0x0C,
+
+	SMALL_ARRAY = 0x10,
+	SMALL_STRING_MAP = 0x20,
+	SMALL_MAP = 0x30,
+	SMALL_BOOL_ARRAY = 0x40,
+	SMALL_UINT_ARRAY = 0x50,
+	SMALL_STRING_ARRAY = 0x60,
+
+	ARRAY_EXT = 0x70,
+	STRING_MAP_EXT = 0x71,
+	MAP_EXT = 0x72,
+	BOOL_ARRAY_EXT = 0x73,
+	UINT_ARRAY_EXT = 0x74,
+	INT_ARRAY_EXT = 0x75,
+	FLOAT_ARRAY_EXT = 0x76,
+	STRING_ARRAY_EXT = 0x77,
+	UINT_DELTA_EXT = 0x78,
+	INT_DELTA_EXT = 0x79,
+	RLE_ARRAY_EXT = 0x7A,
+	INLINE_UINT_BASE = 0x80,
+}
+
+local TINY = {
+	RAW_EXT = 0x80,
+	IDENTIFIER_EXT = 0x81,
+	ASCII_EXT = 0x82,
+	NUMERIC_EXT = 0x83,
+}
+
+local function appendBuffer(w: Writer, data: buffer)
+	flushBits(w)
+	local length = buffer.len(data)
+	ensureCapacity(w, length)
+	buffer.copy(w.Buffer, w.Position, data, 0, length)
+	w.Position += length
+	w.UsedBits += length * 8
+end
+
+local function tinyStringMode(value: string): (number, number)
+	local length = #value
+	local headerBytes = length <= 31 and 1 or 1 + varUIntByteLength(length)
+	local bestMode = 0
+	local bestBytes = headerBytes + length
+
+	local identifier = true
+	local ascii = true
+	local numeric = length > 0
+	for i = 1, length do
+		local byte = string.byte(value, i)
+		if IDENTIFIER_ENCODE[byte] == nil then identifier = false end
+		if byte > 127 then ascii = false end
+		if NUMERIC4_ENCODE[byte] == nil then numeric = false end
+	end
+
+	if identifier then
+		local bytes = headerBytes + math.ceil(length * 6 / 8)
+		if bytes < bestBytes then bestMode = 1; bestBytes = bytes end
+	end
+	if ascii then
+		local bytes = headerBytes + math.ceil(length * 7 / 8)
+		if bytes < bestBytes then bestMode = 2; bestBytes = bytes end
+	end
+	if numeric then
+		local bytes = headerBytes + math.ceil(length * 4 / 8)
+		if bytes < bestBytes then bestMode = 3; bestBytes = bytes end
+	end
+	return bestMode, bestBytes
+end
+
+local function writeTinyString(w: Writer, value: string)
+	flushBits(w)
+	local length = #value
+	local mode = tinyStringMode(value)
+	if length <= 31 then
+		if mode == 0 then writeByte(w, length)
+		elseif mode == 1 then writeByte(w, 0x20 + length)
+		elseif mode == 2 then writeByte(w, 0x40 + length)
+		else writeByte(w, 0x60 + length) end
+	else
+		if mode == 0 then writeByte(w, TINY.RAW_EXT)
+		elseif mode == 1 then writeByte(w, TINY.IDENTIFIER_EXT)
+		elseif mode == 2 then writeByte(w, TINY.ASCII_EXT)
+		else writeByte(w, TINY.NUMERIC_EXT) end
+		writeVarUInt(w, length)
+	end
+
+	if mode == 0 then
+		ensureCapacity(w, length)
+		if length > 0 then buffer.writestring(w.Buffer, w.Position, value) end
+		w.Position += length
+		w.UsedBits += length * 8
+	elseif mode == 1 then
+		for i = 1, length do writeBits(w, IDENTIFIER_ENCODE[string.byte(value, i)] :: number, 6) end
+		flushBits(w)
+	elseif mode == 2 then
+		for i = 1, length do writeBits(w, string.byte(value, i), 7) end
+		flushBits(w)
+	else
+		for i = 1, length do writeBits(w, NUMERIC4_ENCODE[string.byte(value, i)] :: number, 4) end
+		flushBits(w)
+	end
+end
+
+local function readTinyString(r: Reader): string
+	alignReader(r)
+	local header = readByte(r)
+	local mode: number
+	local length: number
+	if header <= 0x1F then mode = 0; length = header
+	elseif header <= 0x3F then mode = 1; length = header - 0x20
+	elseif header <= 0x5F then mode = 2; length = header - 0x40
+	elseif header <= 0x7F then mode = 3; length = header - 0x60
+	elseif header == TINY.RAW_EXT then mode = 0; length = readVarUInt(r)
+	elseif header == TINY.IDENTIFIER_EXT then mode = 1; length = readVarUInt(r)
+	elseif header == TINY.ASCII_EXT then mode = 2; length = readVarUInt(r)
+	elseif header == TINY.NUMERIC_EXT then mode = 3; length = readVarUInt(r)
+	else fail("invalid compact table string header", 2) end
+
+	if mode == 0 then
+		if r.Position + length > r.Length then fail("truncated compact table string", 2) end
+		local value = buffer.readstring(r.Buffer, r.Position, length)
+		r.Position += length
+		return value
+	end
+
+	local output = table.create(length)
+	if mode == 1 then
+		for i = 1, length do
+			local index = readBits(r, 6) + 1
+			if index < 1 or index > #IDENTIFIER_ALPHABET then fail("invalid compact identifier code", 2) end
+			output[i] = string.sub(IDENTIFIER_ALPHABET, index, index)
+		end
+	elseif mode == 2 then
+		for i = 1, length do output[i] = string.char(readBits(r, 7)) end
+	else
+		for i = 1, length do
+			local code = readBits(r, 4)
+			if code > 14 then fail("invalid compact numeric string code", 2) end
+			output[i] = NUMERIC4_DECODE[code + 1]
+		end
+	end
+	if r.BitBuffer ~= 0 then fail("invalid compact table string padding", 2) end
+	alignReader(r)
+	return table.concat(output)
+end
+
+local function compactArrayNormalUIntBytes(value: {any}): number
+	local count = #value
+	local bytes = count <= 15 and 1 or 1 + varUIntByteLength(count)
+	for i = 1, count do bytes += varUIntByteLength(value[i]) end
+	return bytes
+end
+
+local function compactArrayDeltaUIntBytes(value: {any}): number
+	local count = #value
+	local bytes = 1 + varUIntByteLength(count)
+	if count == 0 then return bytes end
+	bytes += varUIntByteLength(value[1])
+	for i = 2, count do bytes += varIntByteLength(value[i] - value[i - 1]) end
+	return bytes
+end
+
+local function compactArrayNormalIntBytes(value: {any}): number
+	local count = #value
+	local bytes = 1 + varUIntByteLength(count)
+	for i = 1, count do bytes += varIntByteLength(value[i]) end
+	return bytes
+end
+
+local function compactArrayDeltaIntBytes(value: {any}): number
+	local count = #value
+	local bytes = 1 + varUIntByteLength(count)
+	if count == 0 then return bytes end
+	bytes += varIntByteLength(value[1])
+	for i = 2, count do bytes += varIntByteLength(value[i] - value[i - 1]) end
+	return bytes
+end
+
+local compactWriteValue: (Writer, any, Options?) -> ()
+local compactReadValue: (Reader) -> any
+
+local function writeCompactCountTag(w: Writer, smallBase: number, extendedTag: number, count: number)
+	if count <= 15 then
+		writeByte(w, smallBase + count)
+	else
+		writeByte(w, extendedTag)
+		writeVarUInt(w, count)
+	end
+end
+
+local function compactWriteArray(w: Writer, value: {any}, options: Options?)
+	local count = #value
+	local arrayKind = (not options or options.HomogeneousArrays ~= false) and classifyArray(value) or "Mixed"
+	local runCount = (not options or options.RunLengthArrays ~= false) and countScalarRuns(value) or count
+	local useRLE = count >= 4 and arrayKind ~= "Bool" and runCount > 0 and runCount <= math.floor(count / 3)
+
+	if useRLE then
+		writeByte(w, CT.RLE_ARRAY_EXT)
+		writeVarUInt(w, count)
+		writeVarUInt(w, runCount)
+		local i = 1
+		while i <= count do
+			local item = value[i]
+			local length = 1
+			while i + length <= count and value[i + length] == item do length += 1 end
+			writeVarUInt(w, length)
+			compactWriteValue(w, item, options)
+			i += length
+		end
+		return
+	end
+
+	if arrayKind == "Bool" then
+		writeCompactCountTag(w, CT.SMALL_BOOL_ARRAY, CT.BOOL_ARRAY_EXT, count)
+		for i = 1, count do writeBits(w, value[i] and 1 or 0, 1) end
+		flushBits(w)
+	elseif arrayKind == "UInt" then
+		local useDelta = count >= 3 and (not options or options.DeltaArrays ~= false)
+		if useDelta then useDelta = compactArrayDeltaUIntBytes(value) < compactArrayNormalUIntBytes(value) end
+		if useDelta then
+			writeByte(w, CT.UINT_DELTA_EXT)
+			writeVarUInt(w, count)
+			writeVarUInt(w, value[1])
+			for i = 2, count do writeVarInt(w, value[i] - value[i - 1]) end
+		else
+			writeCompactCountTag(w, CT.SMALL_UINT_ARRAY, CT.UINT_ARRAY_EXT, count)
+			for i = 1, count do writeVarUInt(w, value[i]) end
+		end
+	elseif arrayKind == "Int" then
+		local useDelta = count >= 3 and (not options or options.DeltaArrays ~= false)
+		if useDelta then useDelta = compactArrayDeltaIntBytes(value) < compactArrayNormalIntBytes(value) end
+		writeByte(w, useDelta and CT.INT_DELTA_EXT or CT.INT_ARRAY_EXT)
+		writeVarUInt(w, count)
+		if count > 0 then
+			writeVarInt(w, value[1])
+			for i = 2, count do
+				if useDelta then writeVarInt(w, value[i] - value[i - 1]) else writeVarInt(w, value[i]) end
+			end
+		end
+	elseif arrayKind == "Float" then
+		writeByte(w, CT.FLOAT_ARRAY_EXT)
+		writeVarUInt(w, count)
+		for i = 1, count do writeF64(w, value[i]) end
+	elseif arrayKind == "String" then
+		writeCompactCountTag(w, CT.SMALL_STRING_ARRAY, CT.STRING_ARRAY_EXT, count)
+		for i = 1, count do writeTinyString(w, value[i]) end
+	else
+		writeCompactCountTag(w, CT.SMALL_ARRAY, CT.ARRAY_EXT, count)
+		for i = 1, count do compactWriteValue(w, value[i], options) end
+	end
+end
+
+local function compactWriteMap(w: Writer, value: {[any]: any}, options: Options?)
+	local keys = sortedMapKeys(value)
+	local allStringKeys = not options or options.CompactMapKeys ~= false
+	if allStringKeys then
+		for _, key in ipairs(keys) do
+			if typeof(key) ~= "string" then allStringKeys = false; break end
+		end
+	end
+	if allStringKeys then
+		writeCompactCountTag(w, CT.SMALL_STRING_MAP, CT.STRING_MAP_EXT, #keys)
+		for _, key in ipairs(keys) do
+			writeTinyString(w, key)
+			compactWriteValue(w, value[key], options)
+		end
+	else
+		writeCompactCountTag(w, CT.SMALL_MAP, CT.MAP_EXT, #keys)
+		for _, key in ipairs(keys) do
+			compactWriteValue(w, key, options)
+			compactWriteValue(w, value[key], options)
+		end
+	end
+end
+
+compactWriteValue = function(w: Writer, value: any, options: Options?)
+	flushBits(w)
+	local kind = typeof(value)
+	if kind == "nil" then writeByte(w, CT.VALUE_NIL)
+	elseif kind == "boolean" then writeByte(w, value and CT.VALUE_TRUE or CT.VALUE_FALSE)
+	elseif kind == "number" then
+		if isSafeUInt(value) and value <= 127 then
+			writeByte(w, CT.INLINE_UINT_BASE + value)
+		else
+			local exponent = power10Exponent(value)
+			if exponent ~= nil then
+				writeByte(w, CT.VALUE_POWER10)
+				writeVarUInt(w, zigzagEncode(exponent) * 2 + (value < 0 and 1 or 0))
+			elseif isSafeUInt(value) then
+				writeByte(w, CT.VALUE_UINT)
+				writeVarUInt(w, value)
+			elseif isSafeInt(value) then
+				writeByte(w, CT.VALUE_INT)
+				writeVarInt(w, value)
+			else
+				writeByte(w, CT.VALUE_FLOAT)
+				writeF64(w, value)
+			end
+		end
+	elseif kind == "string" then
+		writeByte(w, CT.VALUE_STRING)
+		writeTinyString(w, value)
+	elseif kind == "Vector2" then
+		writeByte(w, CT.VALUE_VECTOR2); writeF64(w, value.X); writeF64(w, value.Y)
+	elseif kind == "Vector3" then
+		writeByte(w, CT.VALUE_VECTOR3); writeF64(w, value.X); writeF64(w, value.Y); writeF64(w, value.Z)
+	elseif kind == "Color3" then
+		writeByte(w, CT.VALUE_COLOR3)
+		writeByte(w, math.floor(value.R * 255 + 0.5)); writeByte(w, math.floor(value.G * 255 + 0.5)); writeByte(w, math.floor(value.B * 255 + 0.5))
+	elseif kind == "CFrame" then
+		writeByte(w, CT.VALUE_CFRAME)
+		local components = {value:GetComponents()}
+		for i = 1, 12 do writeF64(w, components[i]) end
+	elseif kind == "buffer" then
+		writeByte(w, CT.VALUE_BUFFER)
+		local packed = Compression.CompressBuffer(value, options)
+		writeVarUInt(w, buffer.len(packed))
+		appendBuffer(w, packed)
+	elseif kind == "table" then
+		if isArray(value) then compactWriteArray(w, value, options) else compactWriteMap(w, value, options) end
+	else
+		fail("unsupported compact table type " .. kind, 2)
+	end
+end
+
+local function readCompactArray(r: Reader, count: number): {any}
+	local result = table.create(count)
+	for i = 1, count do result[i] = compactReadValue(r) end
+	return result
+end
+
+local function readCompactStringMap(r: Reader, count: number): {[any]: any}
+	local result = {}
+	for _ = 1, count do
+		local key = readTinyString(r)
+		result[key] = compactReadValue(r)
+	end
+	return result
+end
+
+local function readCompactMap(r: Reader, count: number): {[any]: any}
+	local result = {}
+	for _ = 1, count do
+		local key = compactReadValue(r)
+		local keyType = typeof(key)
+		if keyType ~= "string" and keyType ~= "number" then fail("invalid compact table map key", 2) end
+		result[key] = compactReadValue(r)
+	end
+	return result
+end
+
+compactReadValue = function(r: Reader): any
+	alignReader(r)
+	local tag = readByte(r)
+	if tag >= CT.INLINE_UINT_BASE then return tag - CT.INLINE_UINT_BASE end
+	if tag >= CT.SMALL_STRING_ARRAY and tag <= CT.SMALL_STRING_ARRAY + 15 then
+		local count = tag - CT.SMALL_STRING_ARRAY
+		local result = table.create(count)
+		for i = 1, count do result[i] = readTinyString(r) end
+		return result
+	end
+	if tag >= CT.SMALL_UINT_ARRAY and tag <= CT.SMALL_UINT_ARRAY + 15 then
+		local count = tag - CT.SMALL_UINT_ARRAY
+		local result = table.create(count)
+		for i = 1, count do result[i] = readVarUInt(r) end
+		return result
+	end
+	if tag >= CT.SMALL_BOOL_ARRAY and tag <= CT.SMALL_BOOL_ARRAY + 15 then
+		local count = tag - CT.SMALL_BOOL_ARRAY
+		local result = table.create(count)
+		for i = 1, count do result[i] = readBits(r, 1) == 1 end
+		if r.BitBuffer ~= 0 then fail("invalid compact bool array padding", 2) end
+		alignReader(r)
+		return result
+	end
+	if tag >= CT.SMALL_MAP and tag <= CT.SMALL_MAP + 15 then return readCompactMap(r, tag - CT.SMALL_MAP) end
+	if tag >= CT.SMALL_STRING_MAP and tag <= CT.SMALL_STRING_MAP + 15 then return readCompactStringMap(r, tag - CT.SMALL_STRING_MAP) end
+	if tag >= CT.SMALL_ARRAY and tag <= CT.SMALL_ARRAY + 15 then return readCompactArray(r, tag - CT.SMALL_ARRAY) end
+
+	if tag == CT.VALUE_NIL then return nil
+	elseif tag == CT.VALUE_FALSE then return false
+	elseif tag == CT.VALUE_TRUE then return true
+	elseif tag == CT.VALUE_STRING then return readTinyString(r)
+	elseif tag == CT.VALUE_FLOAT then return readF64(r)
+	elseif tag == CT.VALUE_UINT then return readVarUInt(r)
+	elseif tag == CT.VALUE_INT then return readVarInt(r)
+	elseif tag == CT.VALUE_POWER10 then
+		local code = readVarUInt(r)
+		local value = 10 ^ zigzagDecode(math.floor(code / 2))
+		return code % 2 == 1 and -value or value
+	elseif tag == CT.VALUE_VECTOR2 then return Vector2.new(readF64(r), readF64(r))
+	elseif tag == CT.VALUE_VECTOR3 then return Vector3.new(readF64(r), readF64(r), readF64(r))
+	elseif tag == CT.VALUE_COLOR3 then return Color3.fromRGB(readByte(r), readByte(r), readByte(r))
+	elseif tag == CT.VALUE_CFRAME then
+		local components = table.create(12)
+		for i = 1, 12 do components[i] = readF64(r) end
+		return CFrame.new(table.unpack(components))
+	elseif tag == CT.VALUE_BUFFER then
+		local length = readVarUInt(r)
+		if r.Position + length > r.Length then fail("truncated compact buffer value", 2) end
+		local packed = buffer.create(length)
+		buffer.copy(packed, 0, r.Buffer, r.Position, length)
+		r.Position += length
+		return Compression.DecompressBuffer(packed)
+	elseif tag == CT.ARRAY_EXT then return readCompactArray(r, readVarUInt(r))
+	elseif tag == CT.STRING_MAP_EXT then return readCompactStringMap(r, readVarUInt(r))
+	elseif tag == CT.MAP_EXT then return readCompactMap(r, readVarUInt(r))
+	elseif tag == CT.BOOL_ARRAY_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readBits(r, 1) == 1 end
+		if r.BitBuffer ~= 0 then fail("invalid compact bool array padding", 2) end
+		alignReader(r)
+		return result
+	elseif tag == CT.UINT_ARRAY_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readVarUInt(r) end
+		return result
+	elseif tag == CT.INT_ARRAY_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readVarInt(r) end
+		return result
+	elseif tag == CT.FLOAT_ARRAY_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readF64(r) end
+		return result
+	elseif tag == CT.STRING_ARRAY_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readTinyString(r) end
+		return result
+	elseif tag == CT.UINT_DELTA_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		if count > 0 then
+			result[1] = readVarUInt(r)
+			for i = 2, count do result[i] = result[i - 1] + readVarInt(r) end
+		end
+		return result
+	elseif tag == CT.INT_DELTA_EXT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		if count > 0 then
+			result[1] = readVarInt(r)
+			for i = 2, count do result[i] = result[i - 1] + readVarInt(r) end
+		end
+		return result
+	elseif tag == CT.RLE_ARRAY_EXT then
+		local count = readVarUInt(r)
+		local runCount = readVarUInt(r)
+		local result = table.create(count)
+		local position = 1
+		for _ = 1, runCount do
+			local length = readVarUInt(r)
+			if length < 1 or position + length - 1 > count then fail("invalid compact RLE array", 2) end
+			local item = compactReadValue(r)
+			for _ = 1, length do result[position] = item; position += 1 end
+		end
+		if position ~= count + 1 then fail("compact RLE array length mismatch", 2) end
+		return result
+	end
+	fail("invalid compact table value tag", 2)
+	return nil
+end
+
+local function encodeCompactTableBuffer(value: {[any]: any}, options: Options?): buffer
+	local w = newWriter(64)
+	writeByte(w, FMT.COMPACT_TABLE_MAGIC)
+	compactWriteValue(w, value, options)
+	return finish(w)
+end
+
+local function decodeCompactTableBuffer(data: buffer): {[any]: any}
+	local r = newReader(data)
+	if readByte(r) ~= FMT.COMPACT_TABLE_MAGIC then fail("invalid compact table header", 2) end
+	local value = compactReadValue(r)
+	if typeof(value) ~= "table" then fail("compact table payload did not decode to table", 2) end
+	alignReader(r)
+	if r.Position ~= r.Length then fail("trailing bytes in compact table payload", 2) end
+	return value
+end
+
+local function compactTableModeFromData(data: buffer): string?
+	if buffer.len(data) < 2 or buffer.readu8(data, 0) ~= FMT.COMPACT_TABLE_MAGIC then return nil end
+	local tag = buffer.readu8(data, 1)
+	if tag >= CT.SMALL_STRING_ARRAY and tag <= CT.SMALL_STRING_ARRAY + 15 then return "CompactStringArray" end
+	if tag >= CT.SMALL_UINT_ARRAY and tag <= CT.SMALL_UINT_ARRAY + 15 then return "CompactUIntArray" end
+	if tag >= CT.SMALL_BOOL_ARRAY and tag <= CT.SMALL_BOOL_ARRAY + 15 then return "CompactBoolArray" end
+	if tag >= CT.SMALL_MAP and tag <= CT.SMALL_MAP + 15 then return "CompactMap" end
+	if tag >= CT.SMALL_STRING_MAP and tag <= CT.SMALL_STRING_MAP + 15 then return "CompactStringMap" end
+	if tag >= CT.SMALL_ARRAY and tag <= CT.SMALL_ARRAY + 15 then return "CompactMixedArray" end
+	if tag == CT.ARRAY_EXT then return "CompactMixedArray" end
+	if tag == CT.STRING_MAP_EXT then return "CompactStringMap" end
+	if tag == CT.MAP_EXT then return "CompactMap" end
+	if tag == CT.BOOL_ARRAY_EXT then return "CompactBoolArray" end
+	if tag == CT.UINT_ARRAY_EXT then return "CompactUIntArray" end
+	if tag == CT.INT_ARRAY_EXT then return "CompactIntArray" end
+	if tag == CT.FLOAT_ARRAY_EXT then return "CompactFloatArray" end
+	if tag == CT.STRING_ARRAY_EXT then return "CompactStringArray" end
+	if tag == CT.UINT_DELTA_EXT then return "CompactUIntDeltaArray" end
+	if tag == CT.INT_DELTA_EXT then return "CompactIntDeltaArray" end
+	if tag == CT.RLE_ARRAY_EXT then return "CompactRLEArray" end
+	return "CompactUnknown"
+end
+
 local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary: DictionaryState)
 	local kind = typeof(value)
-	if kind == "nil" then flushBits(w); writeByte(w, TAG_NIL)
-	elseif kind == "boolean" then flushBits(w); writeByte(w, value and TAG_TRUE or TAG_FALSE)
+	if kind == "nil" then
+		flushBits(w)
+		writeByte(w, TAG.NIL)
+	elseif kind == "boolean" then
+		flushBits(w)
+		writeByte(w, value and TAG.TRUE or TAG.FALSE)
 	elseif kind == "number" then
 		flushBits(w)
-		if isInteger(value) and value >= 0 then writeByte(w, TAG_UINT); writeVarUInt(w, value)
-		elseif isInteger(value) then writeByte(w, TAG_INT); writeVarInt(w, value)
-		else writeByte(w, TAG_FLOAT); writeF64(w, value) end
+		writeNumberPayload(w, value)
 	elseif kind == "string" then
 		local id = dictionary.Encode[value]
 		flushBits(w)
 		if id then
-			writeByte(w, TAG_STRING_REF)
+			writeByte(w, TAG.STRING_REF)
 			writeVarUInt(w, id)
 		else
-			writeByte(w, TAG_STRING)
+			writeByte(w, TAG.STRING)
 			local packed = Compression.CompressString(value, options)
 			writeVarUInt(w, buffer.len(packed))
 			ensureCapacity(w, buffer.len(packed))
@@ -818,33 +2892,118 @@ local function dynamicWrite(w: Writer, value: any, options: Options?, dictionary
 			w.Position += buffer.len(packed)
 			w.UsedBits += buffer.len(packed) * 8
 		end
-	elseif kind == "Vector2" then flushBits(w); writeByte(w, TAG_VECTOR2); writeF64(w, value.X); writeF64(w, value.Y)
-	elseif kind == "Vector3" then flushBits(w); writeByte(w, TAG_VECTOR3); writeF64(w, value.X); writeF64(w, value.Y); writeF64(w, value.Z)
+	elseif kind == "Vector2" then
+		flushBits(w)
+		writeByte(w, TAG.VECTOR2)
+		writeF64(w, value.X)
+		writeF64(w, value.Y)
+	elseif kind == "Vector3" then
+		flushBits(w)
+		writeByte(w, TAG.VECTOR3)
+		writeF64(w, value.X)
+		writeF64(w, value.Y)
+		writeF64(w, value.Z)
 	elseif kind == "Color3" then
-		flushBits(w); writeByte(w, TAG_COLOR3)
+		flushBits(w)
+		writeByte(w, TAG.COLOR3)
 		writeByte(w, math.floor(value.R * 255 + 0.5))
 		writeByte(w, math.floor(value.G * 255 + 0.5))
 		writeByte(w, math.floor(value.B * 255 + 0.5))
 	elseif kind == "CFrame" then
-		flushBits(w); writeByte(w, TAG_CFRAME)
+		flushBits(w)
+		writeByte(w, TAG.CFRAME)
 		local components = {value:GetComponents()}
 		for i = 1, 12 do writeF64(w, components[i]) end
+	elseif kind == "buffer" then
+		flushBits(w)
+		writeByte(w, TAG.BUFFER)
+		local packed = Compression.CompressBuffer(value, options)
+		writeVarUInt(w, buffer.len(packed))
+		ensureCapacity(w, buffer.len(packed))
+		buffer.copy(w.Buffer, w.Position, packed, 0, buffer.len(packed))
+		w.Position += buffer.len(packed)
+		w.UsedBits += buffer.len(packed) * 8
 	elseif kind == "table" then
 		flushBits(w)
 		if isArray(value) then
-			writeByte(w, TAG_ARRAY)
-			writeVarUInt(w, #value)
-			for _, item in ipairs(value) do dynamicWrite(w, item, options, dictionary) end
-		else
-			writeByte(w, TAG_MAP)
-			local keys = {}
-			for key in pairs(value) do
-				if typeof(key) ~= "string" and typeof(key) ~= "number" then fail("map keys must be strings or numbers", 2) end
-				keys[#keys + 1] = key
+			local count = #value
+			local tableCompression = not options or options.TableCompression ~= false
+			local homogeneous = tableCompression and (not options or options.HomogeneousArrays ~= false)
+			local arrayKind = homogeneous and classifyArray(value) or "Mixed"
+			local runCount = tableCompression and (not options or options.RunLengthArrays ~= false) and countScalarRuns(value) or count
+			if count >= 4 and runCount <= math.floor(count / 3) and arrayKind ~= "Bool" then
+				writeByte(w, TAG.ARRAY_RLE)
+				writeVarUInt(w, count)
+				writeVarUInt(w, runCount)
+				local i = 1
+				while i <= count do
+					local item = value[i]
+					local length = 1
+					while i + length <= count and value[i + length] == item do length += 1 end
+					writeVarUInt(w, length)
+					dynamicWrite(w, item, options, dictionary)
+					i += length
+				end
+			elseif arrayKind == "Bool" then
+				writeByte(w, TAG.ARRAY_BOOL)
+				writeVarUInt(w, count)
+				for i = 1, count do writeBits(w, value[i] and 1 or 0, 1) end
+			elseif arrayKind == "UInt" then
+				local useDelta = (not options or options.DeltaArrays ~= false) and canUseUIntDelta(value)
+				writeByte(w, useDelta and TAG.ARRAY_UINT_DELTA or TAG.ARRAY_UINT)
+				writeVarUInt(w, count)
+				if count > 0 then
+					writeVarUInt(w, value[1])
+					for i = 2, count do
+						if useDelta then writeVarInt(w, value[i] - value[i - 1]) else writeVarUInt(w, value[i]) end
+					end
+				end
+			elseif arrayKind == "Int" then
+				local useDelta = (not options or options.DeltaArrays ~= false) and canUseIntDelta(value)
+				writeByte(w, useDelta and TAG.ARRAY_INT_DELTA or TAG.ARRAY_INT)
+				writeVarUInt(w, count)
+				if count > 0 then
+					writeVarInt(w, value[1])
+					for i = 2, count do
+						if useDelta then writeVarInt(w, value[i] - value[i - 1]) else writeVarInt(w, value[i]) end
+					end
+				end
+			elseif arrayKind == "Float" then
+				writeByte(w, TAG.ARRAY_FLOAT)
+				writeVarUInt(w, count)
+				for i = 1, count do writeF64(w, value[i]) end
+			elseif arrayKind == "String" then
+				writeByte(w, TAG.ARRAY_STRING)
+				writeVarUInt(w, count)
+				for i = 1, count do writeCompactString(w, value[i], options, dictionary) end
+			else
+				writeByte(w, TAG.ARRAY)
+				writeVarUInt(w, count)
+				for _, item in ipairs(value) do dynamicWrite(w, item, options, dictionary) end
 			end
-			table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
-			writeVarUInt(w, #keys)
-			for _, key in ipairs(keys) do dynamicWrite(w, key, options, dictionary); dynamicWrite(w, value[key], options, dictionary) end
+		else
+			local keys = sortedMapKeys(value)
+			local allStringKeys = not options or options.CompactMapKeys ~= false
+			if allStringKeys then
+				for _, key in ipairs(keys) do
+					if typeof(key) ~= "string" then allStringKeys = false; break end
+				end
+			end
+			if allStringKeys and (not options or options.TableCompression ~= false) then
+				writeByte(w, TAG.MAP_STRING)
+				writeVarUInt(w, #keys)
+				for _, key in ipairs(keys) do
+					writeCompactString(w, key, options, dictionary)
+					dynamicWrite(w, value[key], options, dictionary)
+				end
+			else
+				writeByte(w, TAG.MAP)
+				writeVarUInt(w, #keys)
+				for _, key in ipairs(keys) do
+					dynamicWrite(w, key, options, dictionary)
+					dynamicWrite(w, value[key], options, dictionary)
+				end
+			end
 		end
 	else
 		fail("unsupported dynamic type " .. kind, 2)
@@ -854,39 +3013,119 @@ end
 local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 	alignReader(r)
 	local tag = readByte(r)
-	if tag == TAG_NIL then return nil
-	elseif tag == TAG_FALSE then return false
-	elseif tag == TAG_TRUE then return true
-	elseif tag == TAG_UINT then return readVarUInt(r)
-	elseif tag == TAG_INT then return readVarInt(r)
-	elseif tag == TAG_FLOAT then return readF64(r)
-	elseif tag == TAG_STRING_REF then
+	if tag == TAG.NIL then return nil
+	elseif tag == TAG.FALSE then return false
+	elseif tag == TAG.TRUE then return true
+	elseif tag == TAG.ZERO then return 0
+	elseif tag == TAG.ONE then return 1
+	elseif tag == TAG.NEG_ONE then return -1
+	elseif tag == TAG.UINT then return readVarUInt(r)
+	elseif tag == TAG.INT then return readVarInt(r)
+	elseif tag == TAG.FLOAT then return readF64(r)
+	elseif tag == TAG.POWER10 then
+		local code = readVarUInt(r)
+		local sign = code % 2
+		local exponent = zigzagDecode(math.floor(code / 2))
+		local value = 10 ^ exponent
+		return sign == 1 and -value or value
+	elseif tag == TAG.STRING_REF then
 		local id = readVarUInt(r)
-		return dictionary.Decode[id]
-	elseif tag == TAG_STRING then
+		local value = dictionary.Decode[id]
+		if value == nil then fail("invalid string dictionary reference", 2) end
+		return value
+	elseif tag == TAG.STRING then
 		local length = readVarUInt(r)
 		if r.Position + length > r.Length then fail("truncated dynamic string", 2) end
 		local data = buffer.create(length)
 		buffer.copy(data, 0, r.Buffer, r.Position, length)
 		r.Position += length
 		return Compression.DecompressString(data)
-	elseif tag == TAG_VECTOR2 then return Vector2.new(readF64(r), readF64(r))
-	elseif tag == TAG_VECTOR3 then return Vector3.new(readF64(r), readF64(r), readF64(r))
-	elseif tag == TAG_COLOR3 then return Color3.fromRGB(readByte(r), readByte(r), readByte(r))
-	elseif tag == TAG_CFRAME then
+	elseif tag == TAG.VECTOR2 then return Vector2.new(readF64(r), readF64(r))
+	elseif tag == TAG.VECTOR3 then return Vector3.new(readF64(r), readF64(r), readF64(r))
+	elseif tag == TAG.COLOR3 then return Color3.fromRGB(readByte(r), readByte(r), readByte(r))
+	elseif tag == TAG.CFRAME then
 		local components = table.create(12)
 		for i = 1, 12 do components[i] = readF64(r) end
 		return CFrame.new(table.unpack(components))
-	elseif tag == TAG_ARRAY then
+	elseif tag == TAG.BUFFER then
+		local length = readVarUInt(r)
+		if r.Position + length > r.Length then fail("truncated dynamic buffer", 2) end
+		local packed = buffer.create(length)
+		buffer.copy(packed, 0, r.Buffer, r.Position, length)
+		r.Position += length
+		return Compression.DecompressBuffer(packed)
+	elseif tag == TAG.ARRAY then
 		local count = readVarUInt(r)
 		local result = table.create(count)
 		for i = 1, count do result[i] = dynamicRead(r, dictionary) end
 		return result
-	elseif tag == TAG_MAP then
+	elseif tag == TAG.ARRAY_BOOL then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readBits(r, 1) == 1 end
+		return result
+	elseif tag == TAG.ARRAY_UINT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readVarUInt(r) end
+		return result
+	elseif tag == TAG.ARRAY_INT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readVarInt(r) end
+		return result
+	elseif tag == TAG.ARRAY_FLOAT then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readF64(r) end
+		return result
+	elseif tag == TAG.ARRAY_STRING then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		for i = 1, count do result[i] = readCompactString(r, dictionary) end
+		return result
+	elseif tag == TAG.ARRAY_RLE then
+		local count = readVarUInt(r)
+		local runCount = readVarUInt(r)
+		local result = table.create(count)
+		local position = 1
+		for _ = 1, runCount do
+			local length = readVarUInt(r)
+			if length < 1 or position + length - 1 > count then fail("invalid RLE array", 2) end
+			local item = dynamicRead(r, dictionary)
+			for _ = 1, length do result[position] = item; position += 1 end
+		end
+		if position ~= count + 1 then fail("RLE array length mismatch", 2) end
+		return result
+	elseif tag == TAG.ARRAY_UINT_DELTA then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		if count > 0 then
+			result[1] = readVarUInt(r)
+			for i = 2, count do result[i] = result[i - 1] + readVarInt(r) end
+		end
+		return result
+	elseif tag == TAG.ARRAY_INT_DELTA then
+		local count = readVarUInt(r)
+		local result = table.create(count)
+		if count > 0 then
+			result[1] = readVarInt(r)
+			for i = 2, count do result[i] = result[i - 1] + readVarInt(r) end
+		end
+		return result
+	elseif tag == TAG.MAP then
 		local count = readVarUInt(r)
 		local result = {}
 		for _ = 1, count do
 			local key = dynamicRead(r, dictionary)
+			result[key] = dynamicRead(r, dictionary)
+		end
+		return result
+	elseif tag == TAG.MAP_STRING then
+		local count = readVarUInt(r)
+		local result = {}
+		for _ = 1, count do
+			local key = readCompactString(r, dictionary)
 			result[key] = dynamicRead(r, dictionary)
 		end
 		return result
@@ -895,29 +3134,117 @@ local function dynamicRead(r: Reader, dictionary: DictionaryState): any
 	return nil
 end
 
+local function writeCompressedStringBlob(w: Writer, value: string, options: Options?)
+	local packed = Compression.CompressString(value, options)
+	writeVarUInt(w, buffer.len(packed))
+	flushBits(w)
+	ensureCapacity(w, buffer.len(packed))
+	buffer.copy(w.Buffer, w.Position, packed, 0, buffer.len(packed))
+	w.Position += buffer.len(packed)
+	w.UsedBits += buffer.len(packed) * 8
+end
+
+local function readCompressedStringBlob(r: Reader): string
+	local length = readVarUInt(r)
+	if r.Position + length > r.Length then fail("truncated dictionary string", 2) end
+	local data = buffer.create(length)
+	buffer.copy(data, 0, r.Buffer, r.Position, length)
+	r.Position += length
+	return Compression.DecompressString(data)
+end
+
+local function assertNoCycles(value: any, active: {[any]: boolean}, visited: {[any]: boolean})
+	if typeof(value) ~= "table" then return end
+	if active[value] then fail("cyclic tables cannot be encoded", 3) end
+	if visited[value] then return end
+	active[value] = true
+	for key, child in pairs(value) do
+		assertNoCycles(key, active, visited)
+		assertNoCycles(child, active, visited)
+	end
+	active[value] = nil
+	visited[value] = true
+end
+
 function Compression.Encode(value: any, options: Options?): Packet
+	local schemaVersion = options and options.SchemaVersion or 1
+	local kind = typeof(value)
+
+	if kind == "buffer" then
+		local compactBuffer = Compression.CompressBuffer(value, options)
+		if Compression.BufferFrameVersion(compactBuffer) == 0 then
+			compactBuffer = bufferRawPacket(value)
+		end
+		return packetFromBuffer(compactBuffer, options, schemaVersion, buffer.len(value) * 8)
+	end
+
+	if kind == "table" and options and options.TableStrategy == "Compact" then
+		assertNoCycles(value, {}, {})
+		local compactTable = encodeCompactTableBuffer(value, options)
+		return packetFromBuffer(compactTable, options, schemaVersion, rawValueBits(value))
+	end
+
+	local atom = encodeCompactAtom(value, options)
+	if atom ~= nil then
+		local packet = packetFromBuffer(atom, options, schemaVersion, rawValueBits(value))
+		if kind == "boolean" then
+			return markBooleanPacket(packet)
+		end
+		return packet
+	end
+
+	assertNoCycles(value, {}, {})
 	local w = newWriter()
 	local dictionary = makeDictionary(value, options)
-	local schemaVersion = options and options.SchemaVersion or 1
-	writeHeader(w, MODE_DYNAMIC, schemaVersion)
+	writeHeader(w, MODE.DYNAMIC, schemaVersion)
 	writeVarUInt(w, #dictionary.Decode)
-	for i = 1, #dictionary.Decode do writeStringRaw(w, dictionary.Decode[i]) end
+	for i = 1, #dictionary.Decode do writeCompressedStringBlob(w, dictionary.Decode[i], options) end
 	dynamicWrite(w, value, options, dictionary)
-	return packetFromBuffer(finish(w), options, schemaVersion)
+	return packetFromBuffer(finish(w), options, schemaVersion, rawValueBits(value))
 end
 
 function Compression.Decode(packet: Packet | buffer, options: Options?): any
+	if typeof(packet) == "table" and (packet :: any).Passthrough == true then
+		local passthroughPacket = packet :: Packet
+		if passthroughPacket.Hash ~= nil and (not options or options.VerifyHash ~= false) then
+			if hashBuffer(passthroughPacket.Data) ~= passthroughPacket.Hash then fail("hash verification failed", 2) end
+		end
+		local handled, passthroughValue = decodePassthroughPacket(passthroughPacket)
+		if handled then return passthroughValue end
+	end
+
 	local data = unwrapPacket(packet, options)
+	if buffer.len(data) >= 1 and (buffer.readu8(data, 0) == FMT.COMPACT_BUFFER_MAGIC or buffer.readu8(data, 0) == FMT.COMPACT_BUFFER_RAW_MAGIC) then
+		return Compression.DecompressBuffer(data)
+	end
+	if buffer.len(data) >= 1 and buffer.readu8(data, 0) == FMT.COMPACT_TABLE_MAGIC then
+		return decodeCompactTableBuffer(data)
+	end
+
+	local atomHandled, atomValue = decodeCompactAtom(data)
+	if atomHandled then return atomValue end
+
 	local r = newReader(data)
-	readHeader(r, MODE_DYNAMIC)
+	if r.Length >= 2 and buffer.readu8(data, 0) == FMT.COMPACT_NUMBER_MAGIC then
+		readByte(r)
+		local compactVersion = readByte(r)
+		if compactVersion ~= FMT.VERSION and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
+		local value = readNumberPayload(r)
+		if r.Position ~= r.Length then fail("trailing bytes in compact number payload", 2) end
+		return value
+	end
+	local _, binaryVersion = readHeader(r, MODE.DYNAMIC)
 	local dictionary: DictionaryState = {Encode = {}, Decode = {}}
 	local count = readVarUInt(r)
 	for i = 1, count do
-		local value = readStringRaw(r)
+		local value = binaryVersion >= 8 and readCompressedStringBlob(r) or readStringRaw(r)
 		dictionary.Decode[i] = value
 		dictionary.Encode[value] = i
 	end
-	return dynamicRead(r, dictionary)
+	local value = dynamicRead(r, dictionary)
+	alignReader(r)
+	if r.Position ~= r.Length then fail("trailing bytes in dynamic payload", 2) end
+	return value
 end
 
 function Compression.Hash(data: buffer): number
@@ -926,10 +3253,13 @@ function Compression.Hash(data: buffer): number
 end
 
 function Compression.Verify(data: buffer, hash: number): boolean
+	if typeof(data) ~= "buffer" then fail("Verify expects buffer", 2) end
+	if typeof(hash) ~= "number" then fail("Verify expects numeric hash", 2) end
 	return hashBuffer(data) == hash
 end
 
 function Compression.Optional(descriptor: Descriptor): Descriptor
+	if typeof(descriptor) ~= "table" or typeof(descriptor.Kind) ~= "string" then fail("Optional expects Descriptor", 2) end
 	local copy = table.clone(descriptor)
 	copy.Optional = true
 	return copy
@@ -941,9 +3271,11 @@ function Compression.Int(): Descriptor return {Kind = "Int"} end
 function Compression.Float(): Descriptor return {Kind = "Float"} end
 function Compression.String(): Descriptor return {Kind = "String"} end
 function Compression.CompressedString(options: Options?): Descriptor return {Kind = "CompressedString", Options = options} end
+function Compression.Buffer(options: Options?): Descriptor return {Kind = "Buffer", Options = options} end
 function Compression.Vector2(): Descriptor return {Kind = "Vector2"} end
 function Compression.Vector3(): Descriptor return {Kind = "Vector3"} end
 function Compression.Color3(): Descriptor return {Kind = "Color3"} end
+function Compression.CFrame(): Descriptor return {Kind = "CFrame"} end
 function Compression.Array(item: Descriptor): Descriptor return {Kind = "Array", Item = item} end
 function Compression.Object(fields: {[string]: Descriptor}): Descriptor return {Kind = "Object", Fields = fields} end
 
@@ -959,37 +3291,581 @@ function Compression.QuantizedVector3(minimum: Vector3, maximum: Vector3, bits: 
 	return {Kind = "QuantizedVector3", Options = {Minimum = minimum, Maximum = maximum, Bits = bits}}
 end
 
-function Compression.Auto(value: any): Descriptor
+local function descriptorsEquivalent(a: Descriptor, b: Descriptor): boolean
+	if a.Kind ~= b.Kind then return false end
+	if a.Kind == "Array" then
+		return a.Item ~= nil and b.Item ~= nil and descriptorsEquivalent(a.Item :: Descriptor, b.Item :: Descriptor)
+	end
+	return true
+end
+
+function Compression.InferDescriptor(value: any): Descriptor
 	local kind = typeof(value)
 	if kind == "boolean" then return Compression.Bool()
 	elseif kind == "number" then
-		if isInteger(value) then
-			if value >= 0 then return Compression.UInt() end
-			return Compression.Int()
-		end
+		if isSafeUInt(value) then return Compression.UInt() end
+		if isSafeInt(value) then return Compression.Int() end
 		return Compression.Float()
 	elseif kind == "string" then
 		if #value >= 24 then return Compression.CompressedString() end
 		return Compression.String()
+	elseif kind == "buffer" then return Compression.Buffer()
 	elseif kind == "Vector2" then return Compression.Vector2()
 	elseif kind == "Vector3" then return Compression.Vector3()
 	elseif kind == "Color3" then return Compression.Color3()
-	elseif kind == "table" and isArray(value) and #value > 0 then
-		return Compression.Array(Compression.Auto(value[1]))
+	elseif kind == "CFrame" then return Compression.CFrame()
+	elseif kind == "table" then
+		if isArray(value) then
+			if #value == 0 then fail("InferDescriptor cannot infer the item type of an empty array", 2) end
+			local item = Compression.InferDescriptor(value[1])
+			for i = 2, #value do
+				local nextDescriptor = Compression.InferDescriptor(value[i])
+				if not descriptorsEquivalent(item, nextDescriptor) then
+					fail("InferDescriptor requires homogeneous arrays; mismatch at index " .. tostring(i), 2)
+				end
+			end
+			return Compression.Array(item)
+		end
+		local fields: {[string]: Descriptor} = {}
+		for key, child in pairs(value) do
+			if typeof(key) ~= "string" then fail("InferDescriptor object keys must be strings", 2) end
+			fields[key] = Compression.InferDescriptor(child)
+		end
+		return Compression.Object(fields)
 	end
-	fail("Auto could not infer descriptor for " .. kind, 2)
+	fail("InferDescriptor could not infer descriptor for " .. kind, 2)
 	return Compression.String()
 end
 
-function Compression.Stats(packet: Packet | buffer): {Bytes: number, Bits: number, Hash: number?}
-	if typeof(packet) == "buffer" then
-		return {Bytes = buffer.len(packet), Bits = buffer.len(packet) * 8, Hash = nil}
+function Compression.AutoDescriptor(value: any): Descriptor
+	return Compression.InferDescriptor(value)
+end
+
+function Compression.StringMode(data: buffer): string
+	if typeof(data) ~= "buffer" then return "Invalid" end
+	if buffer.len(data) == 0 then return "RawPassthrough" end
+	local mode = buffer.readu8(data, 0)
+	if mode > STR.RAW_V3 then return "RawPassthrough" end
+	if mode == STR.RAW then return "Raw" end
+	if mode == STR.LZ_V1 then return "LZ-v1" end
+	if mode == STR.NUMERIC4 then return "Numeric4" end
+	if mode == STR.IDENTIFIER6 then return "Identifier6" end
+	if mode == STR.ASCII7 then return "ASCII7" end
+	if mode == STR.LZ_V2 then return "LZ-v2" end
+	if mode == STR.RAW_V3 then return "Raw" end
+	return "Unknown"
+end
+
+function Compression.StringStats(value: string, options: Options?): {[string]: any}
+	if typeof(value) ~= "string" then fail("StringStats expects string", 2) end
+	local data = Compression.CompressString(value, options)
+	local rawBytes = #value
+	local bytes = buffer.len(data)
+	local delta = rawBytes - bytes
+	local saved = math.max(0, delta)
+	local expanded = math.max(0, -delta)
+	return {
+		Mode = Compression.StringMode(data),
+		Bytes = bytes,
+		Bits = bytes * 8,
+		RawBytes = rawBytes,
+		SavedBytes = saved,
+		ExpandedBytes = expanded,
+		ByteDelta = delta,
+		SavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
+		Ratio = rawBytes > 0 and bytes / rawBytes or 1,
+		IsSmaller = bytes < rawBytes,
+		EncodedBytesText = Compression.FormatBytes(bytes),
+		RawBytesText = Compression.FormatBytes(rawBytes),
+		SavedBytesText = Compression.FormatBytes(saved),
+		ExpandedBytesText = Compression.FormatBytes(expanded),
+	}
+end
+
+function Compression.PrintStringStats(value: string, options: Options?): {[string]: any}
+	local stats = Compression.StringStats(value, options)
+	print("========== Compression v2.2.1 String Stats ==========")
+	print("Mode:", stats.Mode)
+	print("Raw:", stats.RawBytesText)
+	print("Encoded:", stats.EncodedBytesText)
+	print("Saved:", stats.SavedBytesText)
+	print("Expanded:", stats.ExpandedBytesText)
+	print(string.format("Savings: %.2f%%", stats.SavingsPercent))
+	print(string.format("Ratio: %.4fx", stats.Ratio))
+	print("======================================================")
+	return stats
+end
+
+function Compression.TryDecompressString(data: buffer): (boolean, string?)
+	local ok, result = pcall(Compression.DecompressString, data)
+	if ok then return true, result end
+	return false, nil
+end
+
+function Compression.CompressStringSmart(value: string, options: Options?): (buffer, boolean)
+	if typeof(value) ~= "string" then fail("CompressStringSmart expects string", 2) end
+	local packed = Compression.CompressString(value, options)
+	if buffer.len(packed) < #value then return packed, true end
+	local raw = buffer.create(#value)
+	if #value > 0 then buffer.writestring(raw, 0, value) end
+	return raw, false
+end
+
+function Compression.DecompressStringSmart(data: buffer, compressed: boolean): string
+	if typeof(data) ~= "buffer" then fail("DecompressStringSmart expects buffer", 2) end
+	if compressed then return Compression.DecompressString(data) end
+	local length = buffer.len(data)
+	return length > 0 and buffer.readstring(data, 0, length) or ""
+end
+
+local function autoCodecFor(value: any, packet: Packet, options: Options?): string
+	if packet.Codec ~= nil then return packet.Codec end
+	local kind = typeof(value)
+	if kind == "buffer" then return "Buffer/" .. Compression.BufferMode(packet.Data) end
+	if kind == "number" then
+		local tag = buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) or -1
+		if tag == ATOM.DECIMAL then return "CompactDecimal" end
+		if tag == ATOM.FLOAT32 then return "CompactFloat32" end
+		return "CompactNumber"
 	end
-	return {Bytes = packet.Bytes, Bits = packet.Bits, Hash = packet.Hash}
+	if kind == "table" then
+		if buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == FMT.COMPACT_TABLE_MAGIC then
+			return "Table/" .. Compression.TableMode(packet.Data, options)
+		end
+		return "DynamicTable"
+	end
+	if kind == "string" then return "CompactString" end
+	if kind == "boolean" then return "CompactBoolean1Bit" end
+	if kind == "nil" then return "CompactNil" end
+	if kind == "Vector2" then
+		return buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == ATOM.VECTOR2_F32 and "CompactVector2F32" or "CompactVector2"
+	end
+	if kind == "Vector3" then
+		return buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == ATOM.VECTOR3_F32 and "CompactVector3F32" or "CompactVector3"
+	end
+	if kind == "Color3" then return "CompactColor3" end
+	if kind == "CFrame" then
+		return buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == ATOM.CFRAME_F32 and "CompactCFrameF32" or "CompactCFrame"
+	end
+	return "Dynamic" .. kind
+end
+
+function Compression.Compress(value: any, options: Options?): Packet
+	if typeof(value) == "table" and (not options or (options.TableCompression ~= false and options.TableStrategy ~= "Dynamic")) then
+		assertNoCycles(value, {}, {})
+		local data = encodeCompactTableBuffer(value, options)
+		return packetFromBuffer(data, options, options and options.SchemaVersion or 1, rawValueBits(value))
+	end
+	return Compression.Encode(value, options)
+end
+
+function Compression.Decompress(packet: Packet | buffer, options: Options?): any
+	return Compression.Decode(packet, options)
+end
+
+function Compression.Auto(value: any, options: Options?): Packet
+	local packet = Compression.Compress(value, options)
+	local kind = typeof(value)
+	packet.ValueType = kind
+	packet.Codec = autoCodecFor(value, packet, options)
+	if kind == "boolean" then
+		markBooleanPacket(packet)
+	end
+
+	if not options or options.AllowExpansion ~= true then
+		local rawData, rawCodec = rawAutoData(value)
+		if rawData ~= nil and rawCodec ~= nil and buffer.len(rawData) < packet.Bytes then
+			local rawPacket = packetFromBuffer(rawData, options, options and options.SchemaVersion or 1, rawValueBits(value))
+			rawPacket.ValueType = kind
+			rawPacket.Codec = rawCodec
+			rawPacket.Passthrough = true
+			return rawPacket
+		end
+	end
+
+	return packet
+end
+
+function Compression.AutoDecompress(packet: Packet | buffer, options: Options?): any
+	return Compression.Decompress(packet, options)
+end
+
+function Compression.TryAuto(value: any, options: Options?): (boolean, Packet?, string?)
+	local ok, result = pcall(Compression.Auto, value, options)
+	if ok then return true, result, nil end
+	return false, nil, tostring(result)
+end
+
+function Compression.CanAuto(value: any, options: Options?): boolean
+	local ok = pcall(Compression.Auto, value, options)
+	return ok
+end
+
+function Compression.TryAutoDecompress(packet: Packet | buffer, options: Options?): (boolean, any, string?)
+	local ok, result = pcall(Compression.AutoDecompress, packet, options)
+	if ok then return true, result, nil end
+	return false, nil, tostring(result)
+end
+
+function Compression.AutoStats(value: any, options: Options?): {[string]: any}
+	local packet = Compression.Auto(value, options)
+	local stats = Compression.Stats(packet)
+	stats.ValueType = packet.ValueType
+	stats.Codec = packet.Codec
+	stats.EncodedBytesText = Compression.FormatBytes(stats.Bytes)
+	stats.RawBytesText = stats.RawBytes and Compression.FormatBytes(stats.RawBytes) or nil
+	stats.SavedBytesText = Compression.FormatBytes(stats.SavedBytes or 0)
+	stats.ExpandedBytesText = Compression.FormatBytes(stats.ExpandedBytes or 0)
+	return stats
+end
+
+function Compression.PrintAutoStats(value: any, options: Options?): {[string]: any}
+	local stats = Compression.AutoStats(value, options)
+	print("========== Compression v2.2.1 Auto Stats ==========")
+	print("Type:", stats.ValueType)
+	print("Codec:", stats.Codec)
+	print("Raw:", stats.RawBytesText or "Unknown")
+	print("Encoded:", stats.EncodedBytesText)
+	if (stats.ExpandedBytes or 0) > 0 then
+		print("Expanded:", stats.ExpandedBytesText)
+	else
+		print("Saved:", stats.SavedBytesText)
+	end
+	if stats.SavingsPercent ~= nil then print(string.format("Savings: %.2f%%", stats.SavingsPercent)) end
+	if stats.Ratio ~= nil then print(string.format("Ratio: %.4fx", stats.Ratio)) end
+	print("====================================================")
+	return stats
+end
+
+function Compression.CompressNumber(value: number): buffer
+	if typeof(value) ~= "number" then fail("CompressNumber expects number", 2) end
+	local w = newWriter(16)
+	writeNumberPayload(w, value)
+	return finish(w)
+end
+
+function Compression.DecompressNumber(data: buffer): number
+	if typeof(data) ~= "buffer" then fail("DecompressNumber expects buffer", 2) end
+	local r = newReader(data)
+	local value = readNumberPayload(r)
+	if r.Position ~= r.Length then fail("trailing bytes in number payload", 2) end
+	return value
+end
+
+function Compression.NumberStats(value: number): {[string]: any}
+	local data = Compression.CompressNumber(value)
+	local bytes = buffer.len(data)
+	local saved = math.max(0, 8 - bytes)
+	local expanded = math.max(0, bytes - 8)
+	return {
+		Bytes = bytes,
+		Bits = bytes * 8,
+		RawBytes = 8,
+		SavedBytes = saved,
+		ExpandedBytes = expanded,
+		SavingsPercent = saved / 8 * 100,
+		Ratio = bytes / 8,
+		IsSmaller = bytes < 8,
+		BytesText = Compression.FormatBytes and Compression.FormatBytes(bytes) or tostring(bytes) .. " B",
+	}
+end
+
+local TABLE_MODE_NAMES = {
+	[TAG.ARRAY] = "MixedArray",
+	[TAG.MAP] = "Map",
+	[TAG.ARRAY_BOOL] = "BoolArray",
+	[TAG.ARRAY_UINT] = "UIntArray",
+	[TAG.ARRAY_INT] = "IntArray",
+	[TAG.ARRAY_FLOAT] = "FloatArray",
+	[TAG.ARRAY_STRING] = "StringArray",
+	[TAG.ARRAY_RLE] = "RLEArray",
+	[TAG.MAP_STRING] = "StringMap",
+	[TAG.ARRAY_UINT_DELTA] = "UIntDeltaArray",
+	[TAG.ARRAY_INT_DELTA] = "IntDeltaArray",
+}
+
+local function tableEntryCount(value: {[any]: any}): number
+	local count = 0
+	for _ in pairs(value) do count += 1 end
+	return count
+end
+
+local function analyzeTableStructure(value: {[any]: any}): {[string]: any}
+	local result = {
+		Kind = isArray(value) and "Array" or "Map",
+		Entries = tableEntryCount(value),
+		TotalEntries = 0,
+		Tables = 0,
+		Arrays = 0,
+		Maps = 0,
+		MaxDepth = 0,
+		Booleans = 0,
+		Numbers = 0,
+		Strings = 0,
+		Vector2s = 0,
+		Vector3s = 0,
+		Color3s = 0,
+		CFrames = 0,
+		Buffers = 0,
+		OtherValues = 0,
+		StringKeys = 0,
+		NumberKeys = 0,
+	}
+
+	local active: {[any]: boolean} = {}
+
+	local function visitScalar(item: any)
+		local kind = typeof(item)
+		if kind == "boolean" then result.Booleans += 1
+		elseif kind == "number" then result.Numbers += 1
+		elseif kind == "string" then result.Strings += 1
+		elseif kind == "Vector2" then result.Vector2s += 1
+		elseif kind == "Vector3" then result.Vector3s += 1
+		elseif kind == "Color3" then result.Color3s += 1
+		elseif kind == "CFrame" then result.CFrames += 1
+		elseif kind == "buffer" then result.Buffers += 1
+		elseif kind ~= "nil" and kind ~= "table" then result.OtherValues += 1 end
+	end
+
+	local function visitTable(current: {[any]: any}, depth: number)
+		if active[current] then fail("cyclic tables cannot be analyzed", 3) end
+		active[current] = true
+		result.Tables += 1
+		result.MaxDepth = math.max(result.MaxDepth, depth)
+		local array = isArray(current)
+		if array then result.Arrays += 1 else result.Maps += 1 end
+
+		for key, child in pairs(current) do
+			result.TotalEntries += 1
+			if not array then
+				local keyKind = typeof(key)
+				if keyKind == "string" then result.StringKeys += 1
+				elseif keyKind == "number" then result.NumberKeys += 1 end
+			end
+			visitScalar(key)
+			if typeof(child) == "table" then visitTable(child, depth + 1) else visitScalar(child) end
+		end
+		active[current] = nil
+	end
+
+	visitTable(value, 1)
+	return result
+end
+
+local function topLevelDynamicTag(packet: Packet | buffer, options: Options?): number?
+	local data = unwrapPacket(packet, options)
+	if buffer.len(data) < 1 then return nil end
+	if buffer.readu8(data, 0) == FMT.COMPACT_NUMBER_MAGIC or buffer.readu8(data, 0) == FMT.COMPACT_BUFFER_MAGIC then return nil end
+	local r = newReader(data)
+	local ok, tag = pcall(function()
+		local _, binaryVersion = readHeader(r, MODE.DYNAMIC)
+		local count = readVarUInt(r)
+		for _ = 1, count do
+			if binaryVersion >= 8 then readCompressedStringBlob(r) else readStringRaw(r) end
+		end
+		alignReader(r)
+		return readByte(r)
+	end)
+	if not ok then return nil end
+	return tag
+end
+
+function Compression.CompressTable(value: {[any]: any}, options: Options?): buffer
+	if typeof(value) ~= "table" then fail("CompressTable expects table", 2) end
+	assertNoCycles(value, {}, {})
+	if options and (options.TableStrategy == "Dynamic" or options.TableCompression == false) then
+		return Compression.Encode(value, options).Data
+	end
+	return encodeCompactTableBuffer(value, options)
+end
+
+function Compression.CompressTablePacket(value: {[any]: any}, options: Options?): Packet
+	if typeof(value) ~= "table" then fail("CompressTablePacket expects table", 2) end
+	if options and (options.TableStrategy == "Dynamic" or options.TableCompression == false) then return Compression.Encode(value, options) end
+	assertNoCycles(value, {}, {})
+	local data = encodeCompactTableBuffer(value, options)
+	return packetFromBuffer(data, options, options and options.SchemaVersion or 1, rawValueBits(value))
+end
+
+function Compression.DecompressTable(packet: Packet | buffer, options: Options?): {[any]: any}
+	local data = unwrapPacket(packet, options)
+	local value
+	if buffer.len(data) >= 1 and buffer.readu8(data, 0) == FMT.COMPACT_TABLE_MAGIC then
+		value = decodeCompactTableBuffer(data)
+	else
+		value = Compression.Decode(packet, options)
+	end
+	if typeof(value) ~= "table" then fail("decoded value is not a table", 2) end
+	return value
+end
+
+function Compression.TryDecompressTable(packet: Packet | buffer, options: Options?): (boolean, {[any]: any}?)
+	local ok, result = pcall(Compression.DecompressTable, packet, options)
+	if ok then return true, result end
+	return false, nil
+end
+
+function Compression.IsCompactTable(packet: Packet | buffer, options: Options?): boolean
+	local data = unwrapPacket(packet, options)
+	return buffer.len(data) >= 1 and buffer.readu8(data, 0) == FMT.COMPACT_TABLE_MAGIC
+end
+
+function Compression.TableMode(packet: Packet | buffer, options: Options?): string
+	local data = unwrapPacket(packet, options)
+	local compactMode = compactTableModeFromData(data)
+	if compactMode ~= nil then return compactMode end
+	local tag = topLevelDynamicTag(packet, options)
+	if tag == nil then return "Invalid" end
+	return TABLE_MODE_NAMES[tag] or "NotTable"
+end
+
+function Compression.TableBytes(packet: Packet | buffer, options: Options?): number
+	local data = unwrapPacket(packet, options)
+	return buffer.len(data)
+end
+
+function Compression.TableEntries(value: {[any]: any}): number
+	if typeof(value) ~= "table" then fail("TableEntries expects table", 2) end
+	return tableEntryCount(value)
+end
+
+function Compression.TableStructure(value: {[any]: any}): {[string]: any}
+	if typeof(value) ~= "table" then fail("TableStructure expects table", 2) end
+	return analyzeTableStructure(value)
+end
+
+function Compression.TableStats(value: {[any]: any}, options: Options?): {[string]: any}
+	if typeof(value) ~= "table" then fail("TableStats expects table", 2) end
+	local packed = Compression.CompressTable(value, options)
+	local bytes = buffer.len(packed)
+	local rawBytes = math.ceil(rawValueBits(value) / 8)
+	local delta = rawBytes - bytes
+	local saved = math.max(0, delta)
+	local expanded = math.max(0, -delta)
+	local structure = analyzeTableStructure(value)
+	return {
+		Mode = Compression.TableMode(packed, options),
+		Format = Compression.IsCompactTable(packed, options) and "CompactBuffer" or "DynamicBuffer",
+		Bytes = bytes,
+		Bits = bytes * 8,
+		RawBytes = rawBytes,
+		SavedBytes = saved,
+		ExpandedBytes = expanded,
+		ByteDelta = delta,
+		SavingsPercent = rawBytes > 0 and math.max(0, delta / rawBytes * 100) or 0,
+		Ratio = rawBytes > 0 and bytes / rawBytes or 1,
+		IsSmaller = bytes < rawBytes,
+		Kind = structure.Kind,
+		Entries = structure.Entries,
+		TotalEntries = structure.TotalEntries,
+		Tables = structure.Tables,
+		Arrays = structure.Arrays,
+		Maps = structure.Maps,
+		MaxDepth = structure.MaxDepth,
+		Booleans = structure.Booleans,
+		Numbers = structure.Numbers,
+		Strings = structure.Strings,
+		Buffers = structure.Buffers,
+		StringKeys = structure.StringKeys,
+		NumberKeys = structure.NumberKeys,
+		EncodedBytesText = Compression.FormatBytes(bytes),
+		RawBytesText = Compression.FormatBytes(rawBytes),
+		SavedBytesText = Compression.FormatBytes(saved),
+		ExpandedBytesText = Compression.FormatBytes(expanded),
+	}
+end
+
+function Compression.PrintTableStats(value: {[any]: any}, options: Options?): {[string]: any}
+	local stats = Compression.TableStats(value, options)
+	print("========== Compression v2.2.1 Table Stats ==========")
+	print("Mode:", stats.Mode)
+	print("Format:", stats.Format)
+	print("Kind:", stats.Kind)
+	print("Entries:", stats.Entries, "| Total nested entries:", stats.TotalEntries)
+	print("Tables:", stats.Tables, "| Arrays:", stats.Arrays, "| Maps:", stats.Maps, "| Depth:", stats.MaxDepth)
+	print("Estimated raw:", stats.RawBytesText)
+	print("Compressed:", stats.EncodedBytesText)
+	if stats.ExpandedBytes > 0 then
+		print("Expanded:", stats.ExpandedBytesText)
+	else
+		print("Saved:", stats.SavedBytesText)
+	end
+	print(string.format("Savings: %.2f%%", stats.SavingsPercent))
+	print(string.format("Ratio: %.4fx", stats.Ratio))
+	print("=====================================================")
+	return stats
+end
+
+function Compression.EstimateRawBytes(value: any): number
+	return math.ceil(rawValueBits(value) / 8)
+end
+
+function Compression.FormatBytes(bytes: number): string
+	if bytes ~= bytes then return "NaN B" end
+	if bytes == math.huge then return "inf B" end
+	if bytes == -math.huge then return "-inf B" end
+	local sign = bytes < 0 and "-" or ""
+	local value = math.abs(bytes)
+	local units = {"B", "KB", "MB", "GB", "TB"}
+	local unit = 1
+	while value >= 1024 and unit < #units do
+		value /= 1024
+		unit += 1
+	end
+	if unit == 1 then return sign .. tostring(math.floor(value + 0.5)) .. " B" end
+	return string.format("%s%.2f %s", sign, value, units[unit])
+end
+
+function Compression.Stats(packet: Packet | buffer): {[string]: any}
+	if typeof(packet) == "buffer" then
+		local bytes = buffer.len(packet)
+		return {
+			Bytes = bytes,
+			Bits = bytes * 8,
+			Hash = nil,
+			RawBytes = nil,
+			SavedBytes = nil,
+			ExpandedBytes = nil,
+			ByteDelta = nil,
+			SavingsPercent = nil,
+			Ratio = nil,
+			IsSmaller = nil,
+		}
+	end
+	return {
+		Bytes = packet.Bytes,
+		Bits = packet.Bits,
+		UsefulBits = packet.UsefulBits or packet.Bits,
+		PhysicalBits = packet.PhysicalBits or packet.Bits,
+		SavedBits = packet.SavedBits or 0,
+		ExpandedBits = packet.ExpandedBits or 0,
+		BitSavingsPercent = packet.BitSavingsPercent,
+		Hash = packet.Hash,
+		RawBytes = packet.RawBytes,
+		SavedBytes = packet.SavedBytes or 0,
+		ExpandedBytes = packet.ExpandedBytes or 0,
+		ByteDelta = packet.ByteDelta,
+		SavingsPercent = packet.SavingsPercent or 0,
+		Ratio = packet.Ratio,
+		IsSmaller = packet.RawBytes ~= nil and packet.Bits < (packet.RawBytes :: number) * 8 or nil,
+		ValueType = packet.ValueType,
+		Codec = packet.Codec,
+		Passthrough = packet.Passthrough == true,
+	}
+end
+
+function Compression.Analyze(value: any, options: Options?): {[string]: any}
+	local packet = Compression.Compress(value, options)
+	local stats = Compression.Stats(packet)
+	stats.EncodedBytesText = Compression.FormatBytes(stats.Bytes)
+	stats.RawBytesText = stats.RawBytes and Compression.FormatBytes(stats.RawBytes) or nil
+	stats.SavedBytesText = Compression.FormatBytes(stats.SavedBytes or 0)
+	stats.ExpandedBytesText = Compression.FormatBytes(stats.ExpandedBytes or 0)
+	return stats
 end
 
 function Compression.Version(): string
-	return "1.0.0"
+	return "2.2.1"
 end
 
 return Compression
