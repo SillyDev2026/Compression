@@ -7,6 +7,7 @@ export type Mode = "Binary" | "BinaryWithHash"
 export type StringStrategy = "Auto" | "Raw" | "LZ" | "ASCII7" | "Identifier6" | "Numeric4"
 export type TableStrategy = "Auto" | "Compact" | "Dynamic"
 export type BufferStrategy = "Auto" | "Raw" | "LZ" | "Sparse" | "Nibble"
+export type EntropyStrategy = "Auto" | "Huffman" | "None"
 
 export type Options = {
 	Mode: Mode?,
@@ -36,6 +37,11 @@ export type Options = {
 	BufferSearchDepth: number?,
 	BufferWindowSize: number?,
 	BufferMaxMatch: number?,
+	EntropyCoding: boolean?,
+	EntropyStrategy: EntropyStrategy?,
+	HuffmanMinBytes: number?,
+	HuffmanMinSavings: number?,
+	HuffmanMaxCodeBits: number?,
 	AllowExpansion: boolean?,
 }
 
@@ -72,6 +78,10 @@ export type Packet = {
 	PaddingBits: number?,
 	IsPhysicallySmaller: boolean?,
 	IsBitSmaller: boolean?,
+	Entropy: string?,
+	EntropyBytesBefore: number?,
+	EntropyBytesAfter: number?,
+	EntropySavedBytes: number?,
 }
 
 export type BitLayoutField = {
@@ -145,7 +155,11 @@ type SchemaObject = {
 local FMT = {
 	MAGIC_A = 0x43,
 	MAGIC_B = 0x50,
-	VERSION = 22,
+	VERSION = 24,
+	HUFFMAN_MAGIC_A = 0x48,
+	HUFFMAN_MAGIC_B = 0x55,
+	HUFFMAN_MAGIC_C = 0x46,
+	HUFFMAN_MAGIC_D = 0x31,
 	COMPACT_NUMBER_MAGIC = 0xD7,
 	COMPACT_TABLE_MAGIC = 0xD5,
 	COMPACT_MAPPED_TABLE_MAGIC = 0xD2,
@@ -255,6 +269,7 @@ local MAX_SAFE_INTEGER = 9007199254740991
 local MAX_SAFE_ZIGZAG_INTEGER = 4503599627370495
 local MAX_DECODE_STRING_BYTES = 4_194_304
 local MAX_DECODE_CONTAINER_ITEMS = 4_194_304
+local MAX_HUFFMAN_DECODE_BYTES = 16_777_216
 
 local function fail(message: string, level: number?)
 	error("Compression: " .. message, (level or 1) + 1)
@@ -523,6 +538,372 @@ local function hashBuffer(data: buffer): number
 	return hash
 end
 
+type HuffmanNode = {
+	Frequency: number,
+	MinSymbol: number,
+	Symbol: number?,
+	Left: HuffmanNode?,
+	Right: HuffmanNode?,
+}
+
+type HuffmanCode = {
+	Code: number,
+	Length: number,
+}
+
+local function isHuffmanFrame(data: buffer): boolean
+	return buffer.len(data) >= 4
+		and buffer.readu8(data, 0) == FMT.HUFFMAN_MAGIC_A
+		and buffer.readu8(data, 1) == FMT.HUFFMAN_MAGIC_B
+		and buffer.readu8(data, 2) == FMT.HUFFMAN_MAGIC_C
+		and buffer.readu8(data, 3) == FMT.HUFFMAN_MAGIC_D
+end
+
+local function huffmanFrameOriginalLength(data: buffer): number?
+	if not isHuffmanFrame(data) then return nil end
+	local r = newReader(data)
+	r.Position = 4
+	return readVarUInt(r)
+end
+
+local function stringStartsHuffmanMagic(value: string): boolean
+	return #value >= 4
+		and string.byte(value, 1) == FMT.HUFFMAN_MAGIC_A
+		and string.byte(value, 2) == FMT.HUFFMAN_MAGIC_B
+		and string.byte(value, 3) == FMT.HUFFMAN_MAGIC_C
+		and string.byte(value, 4) == FMT.HUFFMAN_MAGIC_D
+end
+
+local function buildHuffmanLengths(data: buffer, maxCodeBits: number): ({[number]: number}?, number)
+	local frequencies: {[number]: number} = {}
+	local length = buffer.len(data)
+	for i = 0, length - 1 do
+		local symbol = buffer.readu8(data, i)
+		frequencies[symbol] = (frequencies[symbol] or 0) + 1
+	end
+
+	local nodes: {HuffmanNode} = {}
+	local symbolCount = 0
+	for symbol = 0, 255 do
+		local frequency = frequencies[symbol]
+		if frequency ~= nil then
+			symbolCount += 1
+			nodes[#nodes + 1] = {
+				Frequency = frequency,
+				MinSymbol = symbol,
+				Symbol = symbol,
+				Left = nil,
+				Right = nil,
+			}
+		end
+	end
+
+	if symbolCount == 0 then return {}, 0 end
+	if symbolCount == 1 then
+		local only = nodes[1].Symbol :: number
+		return {[only] = 1}, 1
+	end
+
+	local function sortNodes()
+		table.sort(nodes, function(a, b)
+			if a.Frequency == b.Frequency then
+				return a.MinSymbol < b.MinSymbol
+			end
+			return a.Frequency < b.Frequency
+		end)
+	end
+
+	while #nodes > 1 do
+		sortNodes()
+		local left = table.remove(nodes, 1) :: HuffmanNode
+		local right = table.remove(nodes, 1) :: HuffmanNode
+		nodes[#nodes + 1] = {
+			Frequency = left.Frequency + right.Frequency,
+			MinSymbol = math.min(left.MinSymbol, right.MinSymbol),
+			Symbol = nil,
+			Left = left,
+			Right = right,
+		}
+	end
+
+	local lengths: {[number]: number} = {}
+	local stack = {{Node = nodes[1], Depth = 0}}
+	while #stack > 0 do
+		local item = table.remove(stack) :: any
+		local node = item.Node :: HuffmanNode
+		local depth = item.Depth :: number
+		if node.Symbol ~= nil then
+			local codeLength = math.max(1, depth)
+			if codeLength > maxCodeBits then return nil, symbolCount end
+			lengths[node.Symbol] = codeLength
+		else
+			if node.Right ~= nil then stack[#stack + 1] = {Node = node.Right, Depth = depth + 1} end
+			if node.Left ~= nil then stack[#stack + 1] = {Node = node.Left, Depth = depth + 1} end
+		end
+	end
+
+	return lengths, symbolCount
+end
+
+local function canonicalHuffmanCodes(lengths: {[number]: number}): ({[number]: HuffmanCode}, {any}, number)
+	local entries = {}
+	local maxLength = 0
+	for symbol = 0, 255 do
+		local length = lengths[symbol]
+		if length ~= nil then
+			entries[#entries + 1] = {Symbol = symbol, Length = length}
+			maxLength = math.max(maxLength, length)
+		end
+	end
+
+	table.sort(entries, function(a, b)
+		if a.Length == b.Length then return a.Symbol < b.Symbol end
+		return a.Length < b.Length
+	end)
+
+	local codes: {[number]: HuffmanCode} = {}
+	local code = 0
+	local previousLength = 0
+	for i, entry in ipairs(entries) do
+		local length = entry.Length
+		if i == 1 then
+			code = 0
+		else
+			code = (code + 1) * 2 ^ (length - previousLength)
+		end
+		if code >= 2 ^ length then fail("invalid Huffman code lengths", 3) end
+		codes[entry.Symbol] = {Code = code, Length = length}
+		previousLength = length
+	end
+
+	return codes, entries, maxLength
+end
+
+local function writeHuffmanCode(w: Writer, code: number, length: number)
+	for shift = length - 1, 0, -1 do
+		local bit = math.floor(code / 2 ^ shift) % 2
+		writeBits(w, bit, 1)
+	end
+end
+
+local function huffmanEncodeFrame(data: buffer, maxCodeBits: number?): buffer?
+	if typeof(data) ~= "buffer" then fail("HuffmanEncode expects buffer", 2) end
+	local originalLength = buffer.len(data)
+	if originalLength > MAX_HUFFMAN_DECODE_BYTES then return nil end
+	if originalLength == 0 then
+		local empty = newWriter(8)
+		writeByte(empty, FMT.HUFFMAN_MAGIC_A)
+		writeByte(empty, FMT.HUFFMAN_MAGIC_B)
+		writeByte(empty, FMT.HUFFMAN_MAGIC_C)
+		writeByte(empty, FMT.HUFFMAN_MAGIC_D)
+		writeVarUInt(empty, 0)
+		writeVarUInt(empty, 0)
+		return finish(empty)
+	end
+	local maximumBits = math.clamp(math.floor(maxCodeBits or 32), 4, 32)
+	local lengths, symbolCount = buildHuffmanLengths(data, maximumBits)
+	if lengths == nil or symbolCount == 0 then return nil end
+
+	local w = newWriter(math.max(16, originalLength))
+	writeByte(w, FMT.HUFFMAN_MAGIC_A)
+	writeByte(w, FMT.HUFFMAN_MAGIC_B)
+	writeByte(w, FMT.HUFFMAN_MAGIC_C)
+	writeByte(w, FMT.HUFFMAN_MAGIC_D)
+	writeVarUInt(w, originalLength)
+	writeVarUInt(w, symbolCount)
+
+	if symbolCount == 1 then
+		for symbol = 0, 255 do
+			if lengths[symbol] ~= nil then
+				writeByte(w, symbol)
+				break
+			end
+		end
+		return finish(w)
+	end
+
+	local codes = canonicalHuffmanCodes(lengths)
+	for symbol = 0, 255 do
+		local code = codes[symbol]
+		if code ~= nil then
+			writeByte(w, symbol)
+			writeByte(w, code.Length)
+		end
+	end
+
+	local body = newWriter(math.max(8, math.ceil(originalLength / 2)))
+	for i = 0, originalLength - 1 do
+		local symbol = buffer.readu8(data, i)
+		local code = codes[symbol]
+		if code == nil then fail("missing Huffman code", 2) end
+		writeHuffmanCode(body, code.Code, code.Length)
+	end
+	local bitLength = body.UsedBits
+	local bodyData = finish(body)
+	writeVarUInt(w, bitLength)
+	flushBits(w)
+	ensureCapacity(w, buffer.len(bodyData))
+	if buffer.len(bodyData) > 0 then buffer.copy(w.Buffer, w.Position, bodyData, 0, buffer.len(bodyData)) end
+	w.Position += buffer.len(bodyData)
+	w.UsedBits += buffer.len(bodyData) * 8
+	return finish(w)
+end
+
+local function huffmanDecodeFrame(data: buffer): buffer
+	if typeof(data) ~= "buffer" then fail("HuffmanDecode expects buffer", 2) end
+	if not isHuffmanFrame(data) then fail("invalid Huffman frame", 2) end
+	local r = newReader(data)
+	if readByte(r) ~= FMT.HUFFMAN_MAGIC_A
+		or readByte(r) ~= FMT.HUFFMAN_MAGIC_B
+		or readByte(r) ~= FMT.HUFFMAN_MAGIC_C
+		or readByte(r) ~= FMT.HUFFMAN_MAGIC_D then
+		fail("invalid Huffman frame", 2)
+	end
+
+	local originalLength = readVarUInt(r)
+	if originalLength > MAX_HUFFMAN_DECODE_BYTES then fail("Huffman output exceeds decode limit", 2) end
+	local symbolCount = readVarUInt(r)
+	if symbolCount == 0 then
+		if originalLength ~= 0 or r.Position ~= r.Length then fail("invalid empty Huffman frame", 2) end
+		return buffer.create(0)
+	end
+	if symbolCount > 256 then fail("invalid Huffman symbol count", 2) end
+
+	if symbolCount == 1 then
+		if r.Position + 1 ~= r.Length then fail("invalid single-symbol Huffman frame", 2) end
+		local symbol = readByte(r)
+		local result = buffer.create(originalLength)
+		if originalLength > 0 then buffer.fill(result, 0, symbol, originalLength) end
+		return result
+	end
+
+	local lengths: {[number]: number} = {}
+	for _ = 1, symbolCount do
+		local symbol = readByte(r)
+		local length = readByte(r)
+		if length < 1 or length > 32 then fail("invalid Huffman code length", 2) end
+		if lengths[symbol] ~= nil then fail("duplicate Huffman symbol", 2) end
+		lengths[symbol] = length
+	end
+
+	local _, entries, maxLength = canonicalHuffmanCodes(lengths)
+	if #entries ~= symbolCount then fail("invalid Huffman codebook", 2) end
+	local decodeByLength: {[number]: {[number]: number}} = {}
+	local codes = canonicalHuffmanCodes(lengths)
+	for _, entry in ipairs(entries) do
+		local code = codes[entry.Symbol]
+		local bucket = decodeByLength[code.Length]
+		if bucket == nil then bucket = {}; decodeByLength[code.Length] = bucket end
+		if bucket[code.Code] ~= nil then fail("duplicate Huffman code", 2) end
+		bucket[code.Code] = entry.Symbol
+	end
+
+	local bitLength = readVarUInt(r)
+	local payloadBytes = math.ceil(bitLength / 8)
+	if r.Position + payloadBytes ~= r.Length then fail("invalid Huffman payload length", 2) end
+	local payload = buffer.create(payloadBytes)
+	if payloadBytes > 0 then buffer.copy(payload, 0, r.Buffer, r.Position, payloadBytes) end
+	local body = newReader(payload)
+	local result = buffer.create(originalLength)
+	local consumedBits = 0
+
+	for outputIndex = 0, originalLength - 1 do
+		local code = 0
+		local found: number? = nil
+		for length = 1, maxLength do
+			if consumedBits >= bitLength then fail("truncated Huffman bitstream", 2) end
+			code = code * 2 + readBits(body, 1)
+			consumedBits += 1
+			local bucket = decodeByLength[length]
+			if bucket ~= nil then
+				local symbol = bucket[code]
+				if symbol ~= nil then
+					found = symbol
+					break
+				end
+			end
+		end
+		if found == nil then fail("invalid Huffman bitstream", 2) end
+		buffer.writeu8(result, outputIndex, found)
+	end
+
+	if consumedBits ~= bitLength then fail("Huffman bit length mismatch", 2) end
+	return result
+end
+
+local function entropyStrategy(options: Options?): EntropyStrategy
+	if options and options.EntropyCoding == false then return "None" end
+	local strategy: EntropyStrategy = options and options.EntropyStrategy or "Auto"
+	if strategy ~= "Auto" and strategy ~= "Huffman" and strategy ~= "None" then
+		fail("invalid EntropyStrategy " .. tostring(strategy), 3)
+	end
+	return strategy
+end
+
+local function maybeHuffman(data: buffer, options: Options?): (buffer, boolean)
+	if isHuffmanFrame(data) then return data, true end
+	local strategy = entropyStrategy(options)
+	if strategy == "None" then return data, false end
+	local minimum = math.max(1, math.floor(options and options.HuffmanMinBytes or 16))
+	if strategy == "Auto" and buffer.len(data) < minimum then return data, false end
+	local maxCodeBits = math.clamp(math.floor(options and options.HuffmanMaxCodeBits or 32), 4, 32)
+	local candidate = huffmanEncodeFrame(data, maxCodeBits)
+	if candidate == nil then return data, false end
+	if strategy == "Huffman" then
+		if options and options.AllowExpansion == true then return candidate, true end
+		if buffer.len(candidate) < buffer.len(data) then return candidate, true end
+		return data, false
+	end
+	local minimumSavings = math.max(0, math.floor(options and options.HuffmanMinSavings or 1))
+	if buffer.len(candidate) + minimumSavings <= buffer.len(data) then
+		return candidate, true
+	end
+	return data, false
+end
+
+local function entropyDecodeIfNeeded(data: buffer): (buffer, boolean)
+	if isHuffmanFrame(data) then return huffmanDecodeFrame(data), true end
+	return data, false
+end
+
+function Compression.IsHuffman(data: buffer): boolean
+	return typeof(data) == "buffer" and isHuffmanFrame(data)
+end
+
+function Compression.HuffmanEncode(data: buffer, options: Options?): buffer
+	if typeof(data) ~= "buffer" then fail("HuffmanEncode expects buffer", 2) end
+	local maxCodeBits = math.clamp(math.floor(options and options.HuffmanMaxCodeBits or 32), 4, 32)
+	local encoded = huffmanEncodeFrame(data, maxCodeBits)
+	if encoded == nil and maxCodeBits < 32 then encoded = huffmanEncodeFrame(data, 32) end
+	if encoded == nil then fail("Huffman code length exceeds supported 32-bit limit", 2) end
+	return encoded
+end
+
+function Compression.HuffmanDecode(data: buffer): buffer
+	return huffmanDecodeFrame(data)
+end
+
+function Compression.TryHuffman(data: buffer, options: Options?): (buffer, boolean)
+	if typeof(data) ~= "buffer" then fail("TryHuffman expects buffer", 2) end
+	return maybeHuffman(data, options)
+end
+
+function Compression.HuffmanStats(data: buffer, options: Options?): {[string]: any}
+	if typeof(data) ~= "buffer" then fail("HuffmanStats expects buffer", 2) end
+	local encoded, selected = maybeHuffman(data, options)
+	local rawBytes = buffer.len(data)
+	local bytes = buffer.len(encoded)
+	return {
+		Selected = selected,
+		RawBytes = rawBytes,
+		Bytes = bytes,
+		SavedBytes = math.max(0, rawBytes - bytes),
+		ExpandedBytes = math.max(0, bytes - rawBytes),
+		SavingsPercent = rawBytes > 0 and math.max(0, (rawBytes - bytes) / rawBytes * 100) or 0,
+		Ratio = rawBytes > 0 and bytes / rawBytes or 1,
+	}
+end
+
 local function isInteger(value: number): boolean
 	return value == value and value ~= math.huge and value ~= -math.huge and value % 1 == 0
 end
@@ -650,7 +1031,7 @@ local NUMERIC4_DECODE = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "-", 
 local function rawStringPacket(value: string): buffer
 	if #value == 0 then return buffer.create(0) end
 	local first = string.byte(value, 1)
-	if first > STR.RAW_V3 then
+	if first > STR.RAW_V3 and not stringStartsHuffmanMagic(value) then
 		local raw = buffer.create(#value)
 		buffer.writestring(raw, 0, value)
 		return raw
@@ -819,34 +1200,44 @@ function Compression.CompressString(value: string, options: Options?): buffer
 	local raw = rawStringPacket(value)
 	if options and options.CompressStrings == false then return raw end
 	local strategy: StringStrategy = options and options.StringStrategy or "Auto"
-	if strategy == "Raw" then return raw end
-	if strategy == "Numeric4" then
+	local best: buffer
+	if strategy == "Raw" then
+		best = raw
+	elseif strategy == "Numeric4" then
 		local candidate = numeric4Packet(value)
 		if candidate == nil then fail("Numeric4 strategy only supports 0-9 + - . e E", 2) end
-		return candidate
+		best = candidate
 	elseif strategy == "Identifier6" then
 		local candidate = identifier6Packet(value)
 		if candidate == nil then fail("Identifier6 strategy only supports A-Z a-z 0-9 _ -", 2) end
-		return candidate
+		best = candidate
 	elseif strategy == "ASCII7" then
 		local candidate = ascii7Packet(value)
 		if candidate == nil then fail("ASCII7 strategy only supports ASCII bytes 0-127", 2) end
-		return candidate
+		best = candidate
 	elseif strategy == "LZ" then
-		return lzV2Packet(value, options)
-	elseif strategy ~= "Auto" then
+		best = lzV2Packet(value, options)
+	elseif strategy == "Auto" then
+		best = raw
+		best = chooseSmaller(best, numeric4Packet(value))
+		best = chooseSmaller(best, identifier6Packet(value))
+		best = chooseSmaller(best, ascii7Packet(value))
+		local minLength = math.max(3, options and options.StringMinLength or 16)
+		if #value >= minLength then best = chooseSmaller(best, lzV2Packet(value, options)) end
+	else
 		fail("invalid StringStrategy " .. tostring(strategy), 2)
+		best = raw
 	end
 
-	local best = raw
-	best = chooseSmaller(best, numeric4Packet(value))
-	best = chooseSmaller(best, identifier6Packet(value))
-	best = chooseSmaller(best, ascii7Packet(value))
-	local minLength = math.max(3, options and options.StringMinLength or 16)
-	if #value >= minLength then best = chooseSmaller(best, lzV2Packet(value, options)) end
-	return best
-end
+	if strategy ~= "Raw"
+		and (not options or options.AllowExpansion ~= true)
+		and buffer.len(best) > buffer.len(raw) then
+		best = raw
+	end
 
+	local entropyData = maybeHuffman(best, options)
+	return entropyData
+end
 local function decompressStringLegacyV1(r: Reader): string
 	local originalLength = readVarUInt(r)
 	if originalLength > MAX_DECODE_STRING_BYTES then
@@ -882,6 +1273,7 @@ end
 
 function Compression.DecompressString(data: buffer): string
 	if typeof(data) ~= "buffer" then fail("DecompressString expects buffer", 2) end
+	data = entropyDecodeIfNeeded(data)
 	if buffer.len(data) == 0 then return "" end
 	local first = buffer.readu8(data, 0)
 	if first > STR.RAW_V3 then
@@ -1042,7 +1434,7 @@ local function bufferRawCandidate(value: buffer): buffer
 	local length = buffer.len(value)
 	if length == 0 then return buffer.create(0) end
 	local first = buffer.readu8(value, 0)
-	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then
+	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC and not isHuffmanFrame(value) then
 		local raw = buffer.create(length)
 		buffer.copy(raw, 0, value, 0, length)
 		return raw
@@ -1312,27 +1704,41 @@ function Compression.CompressBuffer(value: buffer, options: Options?): buffer
 	if options and options.CompressBuffers == false then return raw end
 
 	local strategy: BufferStrategy = options and options.BufferStrategy or "Auto"
-	if strategy == "Raw" then return raw end
-	if strategy == "LZ" then return bufferLZPacket(value, options) end
-	if strategy == "Sparse" then return bestSparseBuffer(value, raw) end
-	if strategy == "Nibble" then return bestNibbleBuffer(value, raw) end
-	if strategy ~= "Auto" then fail("invalid BufferStrategy " .. tostring(strategy), 2) end
+	local best: buffer
+	if strategy == "Raw" then
+		best = raw
+	elseif strategy == "LZ" then
+		best = bufferLZPacket(value, options)
+	elseif strategy == "Sparse" then
+		best = bestSparseBuffer(value, raw)
+	elseif strategy == "Nibble" then
+		best = bestNibbleBuffer(value, raw)
+	elseif strategy == "Auto" then
+		best = raw
+		best = chooseSmaller(best, bufferFillPacket(value))
+		best = chooseSmaller(best, bufferSparsePower2Packet(value))
+		best = chooseSmaller(best, bufferSparseZeroPacket(value))
+		best = chooseSmaller(best, bufferNibblePacket(value, false))
+		best = chooseSmaller(best, bufferNibblePacket(value, true))
 
-	local best = raw
-	best = chooseSmaller(best, bufferFillPacket(value))
-	best = chooseSmaller(best, bufferSparsePower2Packet(value))
-	best = chooseSmaller(best, bufferSparseZeroPacket(value))
-	best = chooseSmaller(best, bufferNibblePacket(value, false))
-	best = chooseSmaller(best, bufferNibblePacket(value, true))
-
-	local minimum = math.max(3, options and options.BufferMinLength or 6)
-	if buffer.len(value) >= minimum then
-		best = chooseSmaller(best, bufferLZPacket(value, options))
+		local minimum = math.max(3, options and options.BufferMinLength or 6)
+		if buffer.len(value) >= minimum then
+			best = chooseSmaller(best, bufferLZPacket(value, options))
+		end
+	else
+		fail("invalid BufferStrategy " .. tostring(strategy), 2)
+		best = raw
 	end
 
-	return best
-end
+	if strategy ~= "Raw"
+		and (not options or options.AllowExpansion ~= true)
+		and buffer.len(best) > buffer.len(raw) then
+		best = raw
+	end
 
+	local entropyData = maybeHuffman(best, options)
+	return entropyData
+end
 local function decompressLZBufferBody(r: Reader, originalLength: number): buffer
 	local result = buffer.create(originalLength)
 	local outputPosition = 0
@@ -1368,6 +1774,25 @@ local function decompressLZBufferBody(r: Reader, originalLength: number): buffer
 	return result
 end
 
+local function validateBitmapPadding(bitmap: buffer, originalLength: number, label: string)
+	local bitmapBytes = buffer.len(bitmap)
+	if bitmapBytes == 0 or originalLength % 8 == 0 then return end
+	local usedBits = originalLength % 8
+	local last = buffer.readu8(bitmap, bitmapBytes - 1)
+	local validMask = 2 ^ usedBits - 1
+	if bit32.band(last, 255 - validMask) ~= 0 then
+		fail("invalid " .. label .. " bitmap padding", 3)
+	end
+end
+
+local function countBitmapBits(bitmap: buffer, originalLength: number): number
+	local count = 0
+	for i = 0, originalLength - 1 do
+		if bitmapHas(bitmap, i) then count += 1 end
+	end
+	return count
+end
+
 local function decompressSparseZero(r: Reader, originalLength: number): buffer
 	local bitmapBytes = math.ceil(originalLength / 8)
 	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-zero bitmap", 2) end
@@ -1375,6 +1800,7 @@ local function decompressSparseZero(r: Reader, originalLength: number): buffer
 	local bitmap = buffer.create(bitmapBytes)
 	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
 	r.Position += bitmapBytes
+	validateBitmapPadding(bitmap, originalLength, "sparse-zero")
 
 	local result = buffer.create(originalLength)
 	for i = 0, originalLength - 1 do
@@ -1388,9 +1814,65 @@ local function decompressSparseZero(r: Reader, originalLength: number): buffer
 	return result
 end
 
-local function decompressSparsePower2(r: Reader, originalLength: number): buffer
-	local result = buffer.create(originalLength)
+local function decodeSparsePower2Bitmap(r: Reader, originalLength: number): buffer
+	local bitmapBytes = math.ceil(originalLength / 8)
+	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-power2 bitmap", 2) end
 
+	local bitmap = buffer.create(bitmapBytes)
+	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
+	r.Position += bitmapBytes
+	validateBitmapPadding(bitmap, originalLength, "sparse-power2")
+
+	local nonZeroCount = countBitmapBits(bitmap, originalLength)
+	local requiredExponentBytes = math.ceil(nonZeroCount * 3 / 8)
+	if r.Position + requiredExponentBytes ~= r.Length then
+		fail("sparse-power2 exponent payload length mismatch", 2)
+	end
+
+	local result = buffer.create(originalLength)
+	for i = 0, originalLength - 1 do
+		if bitmapHas(bitmap, i) then
+			local exponent = readBits(r, 3)
+			buffer.writeu8(result, i, 2 ^ exponent)
+		end
+	end
+
+	if r.Position ~= r.Length or r.BitBuffer ~= 0 then
+		fail("invalid sparse-power2 padding or trailing bytes", 2)
+	end
+	return result
+end
+
+local function shortSparsePower2LooksLegacyBitmap(r: Reader, originalLength: number): boolean
+	local bitmapBytes = math.ceil(originalLength / 8)
+	local remaining = r.Length - r.Position
+	if remaining < bitmapBytes then return false end
+
+	local bitmap = buffer.create(bitmapBytes)
+	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
+
+	if bitmapBytes > 0 and originalLength % 8 ~= 0 then
+		local usedBits = originalLength % 8
+		local last = buffer.readu8(bitmap, bitmapBytes - 1)
+		local validMask = 2 ^ usedBits - 1
+		if bit32.band(last, 255 - validMask) ~= 0 then return false end
+	end
+
+	local nonZeroCount = countBitmapBits(bitmap, originalLength)
+	if nonZeroCount <= 7 then return false end
+	local expected = bitmapBytes + math.ceil(nonZeroCount * 3 / 8)
+	return remaining == expected
+end
+
+local function decompressSparsePower2(r: Reader, originalLength: number): buffer
+	-- v2.3.1 could emit the bitmap form for short buffers when there were
+	-- more than seven non-zero power-of-two entries. The old short decoder
+	-- could confuse that payload with the compact 7-bit-entry form.
+	if originalLength <= 14 and shortSparsePower2LooksLegacyBitmap(r, originalLength) then
+		return decodeSparsePower2Bitmap(r, originalLength)
+	end
+
+	local result = buffer.create(originalLength)
 	if originalLength <= 14 then
 		local payloadBytes = r.Length - r.Position
 		if payloadBytes < 1 or payloadBytes > 7 then fail("invalid compact sparse-power2 payload", 2) end
@@ -1407,21 +1889,7 @@ local function decompressSparsePower2(r: Reader, originalLength: number): buffer
 		return result
 	end
 
-	local bitmapBytes = math.ceil(originalLength / 8)
-	if r.Position + bitmapBytes > r.Length then fail("truncated sparse-power2 bitmap", 2) end
-	local bitmap = buffer.create(bitmapBytes)
-	if bitmapBytes > 0 then buffer.copy(bitmap, 0, r.Buffer, r.Position, bitmapBytes) end
-	r.Position += bitmapBytes
-
-	for i = 0, originalLength - 1 do
-		if bitmapHas(bitmap, i) then
-			local exponent = readBits(r, 3)
-			buffer.writeu8(result, i, 2 ^ exponent)
-		end
-	end
-
-	if r.Position ~= r.Length or r.BitBuffer ~= 0 then fail("invalid sparse-power2 padding or trailing bytes", 2) end
-	return result
+	return decodeSparsePower2Bitmap(r, originalLength)
 end
 
 local function decompressNibbleBuffer(r: Reader, originalLength: number, high: boolean): buffer
@@ -1453,6 +1921,7 @@ end
 
 function Compression.DecompressBuffer(data: buffer): buffer
 	if typeof(data) ~= "buffer" then fail("DecompressBuffer expects buffer", 2) end
+	data = entropyDecodeIfNeeded(data)
 	if buffer.len(data) == 0 then return buffer.create(0) end
 	local first = buffer.readu8(data, 0)
 	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then
@@ -1507,6 +1976,11 @@ end
 
 function Compression.BufferMode(data: buffer): string
 	if typeof(data) ~= "buffer" then return "Invalid" end
+	if isHuffmanFrame(data) then
+		local ok, decoded = pcall(huffmanDecodeFrame, data)
+		if not ok then return "Invalid" end
+		return "Huffman/" .. Compression.BufferMode(decoded)
+	end
 	if buffer.len(data) == 0 then return "RawPassthrough" end
 	local first = buffer.readu8(data, 0)
 	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then return "RawPassthrough" end
@@ -1530,6 +2004,7 @@ end
 
 function Compression.BufferFrameVersion(data: buffer): number?
 	if typeof(data) ~= "buffer" then return nil end
+	if isHuffmanFrame(data) then return 4 end
 	if buffer.len(data) == 0 then return 0 end
 	local first = buffer.readu8(data, 0)
 	if first ~= FMT.COMPACT_BUFFER_MAGIC and first ~= FMT.COMPACT_BUFFER_RAW_MAGIC then return 0 end
@@ -1570,7 +2045,7 @@ end
 
 function Compression.PrintBufferStats(value: buffer, options: Options?): {[string]: any}
 	local stats = Compression.BufferStats(value, options)
-	print("========== Compression v2.3.1 Buffer Stats ==========")
+	print("========== Compression v2.5.5 Buffer Stats ==========")
 	print("Mode:", stats.Mode, "| Frame:", "v" .. tostring(stats.FrameVersion or "?"))
 	print("Raw:", Compression.FormatBytes(stats.RawBytes))
 	print("Encoded:", Compression.FormatBytes(stats.Bytes))
@@ -1665,9 +2140,20 @@ local function validate(descriptor: Descriptor, value: any, path: string)
 	end
 end
 
+local function descriptorUsesBitStream(kind: string): boolean
+	-- Objects can continue an existing bit stream because their children
+	-- perform their own alignment when necessary. This preserves bit packing
+	-- for nested Bool/optional fields instead of forcing a padding byte.
+	return kind == "Bool"
+		or kind == "Quantized"
+		or kind == "QuantizedVector3"
+		or kind == "Object"
+end
+
 local function writeDescriptor(w: Writer, descriptor: Descriptor, value: any)
 	local kind = descriptor.Kind
 	local o = descriptor.Options
+	if not descriptorUsesBitStream(kind) then flushBits(w) end
 	if kind == "Bool" then writeBits(w, value and 1 or 0, 1)
 	elseif kind == "UInt" then writeVarUInt(w, value)
 	elseif kind == "Int" then writeVarInt(w, value)
@@ -1756,6 +2242,7 @@ end
 local function readDescriptor(r: Reader, descriptor: Descriptor, binaryVersion: number?): any
 	local kind = descriptor.Kind
 	local o = descriptor.Options
+	if not descriptorUsesBitStream(kind) then alignReader(r) end
 	if kind == "Bool" then return readBits(r, 1) == 1
 	elseif kind == "UInt" then return readVarUInt(r)
 	elseif kind == "Int" then return readVarInt(r)
@@ -1910,7 +2397,7 @@ end
 local function readHeader(r: Reader, expectedMode: number): (number, number)
 	if readByte(r) ~= FMT.MAGIC_A or readByte(r) ~= FMT.MAGIC_B then fail("invalid binary header", 2) end
 	local binaryVersion = readByte(r)
-	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
+	if binaryVersion ~= FMT.VERSION and binaryVersion ~= 23 and binaryVersion ~= 22 and binaryVersion ~= 21 and binaryVersion ~= 20 and binaryVersion ~= 19 and binaryVersion ~= 18 and binaryVersion ~= 17 and binaryVersion ~= 16 and binaryVersion ~= 15 and binaryVersion ~= 14 and binaryVersion ~= 13 and binaryVersion ~= 12 and binaryVersion ~= 11 and binaryVersion ~= 10 and binaryVersion ~= 9 and binaryVersion ~= 8 and binaryVersion ~= 7 and binaryVersion ~= 6 then fail("unsupported binary version", 2) end
 	r.LegacyVarUInt = binaryVersion == 6
 	if readByte(r) ~= expectedMode then fail("unexpected binary mode", 2) end
 	return readVarUInt(r), binaryVersion
@@ -2055,6 +2542,37 @@ local function packetFromBuffer(
 	}
 end
 
+local function packetFromEntropy(
+	data: buffer,
+	options: Options?,
+	schemaVersion: number?,
+	rawBits: number?,
+	usefulBits: number?,
+	paddingBits: number?
+): Packet
+	local alreadyHuffman = isHuffmanFrame(data)
+	local entropySourceBytes = buffer.len(data)
+	if alreadyHuffman then
+		entropySourceBytes = huffmanFrameOriginalLength(data) or buffer.len(data)
+	end
+	local encoded, usedHuffman = maybeHuffman(data, options)
+	local packet
+	if usedHuffman then
+		packet = packetFromBuffer(encoded, options, schemaVersion, rawBits, buffer.len(encoded) * 8, 0)
+		packet.Entropy = "Huffman"
+		packet.EntropyBytesBefore = entropySourceBytes
+		packet.EntropyBytesAfter = buffer.len(encoded)
+		packet.EntropySavedBytes = math.max(0, entropySourceBytes - buffer.len(encoded))
+	else
+		packet = packetFromBuffer(data, options, schemaVersion, rawBits, usefulBits, paddingBits)
+		packet.Entropy = "None"
+		packet.EntropyBytesBefore = buffer.len(data)
+		packet.EntropyBytesAfter = buffer.len(data)
+		packet.EntropySavedBytes = 0
+	end
+	return packet
+end
+
 local function markBooleanPacket(packet: Packet): Packet
 	local rawBits = 8
 	local usefulBits = 1
@@ -2079,13 +2597,17 @@ local function markBooleanPacket(packet: Packet): Packet
 end
 
 local function unwrapPacket(packet: Packet | buffer, options: Options?): (buffer, number?)
-	if typeof(packet) == "buffer" then return packet, nil end
+	if typeof(packet) == "buffer" then
+		local decoded = entropyDecodeIfNeeded(packet)
+		return decoded, nil
+	end
 	if typeof(packet) ~= "table" or typeof((packet :: any).Data) ~= "buffer" then fail("expected Packet or buffer", 2) end
 	local object = packet :: Packet
 	if object.Hash ~= nil and (not options or options.VerifyHash ~= false) then
 		if hashBuffer(object.Data) ~= object.Hash then fail("hash verification failed", 2) end
 	end
-	return object.Data, object.SchemaVersion
+	local decoded = entropyDecodeIfNeeded(object.Data)
+	return decoded, object.SchemaVersion
 end
 
 local function rawValueBits(value: any): number
@@ -2306,7 +2828,7 @@ function Schema:Encode(value: {[string]: any}, options: Options?): Packet
 		if present then validate(descriptor, fieldValue, field.Name); writeDescriptor(w, descriptor, fieldValue) end
 	end
 	local data = finish(w)
-	return packetFromBuffer(
+	return packetFromEntropy(
 		data,
 		options,
 		self.Version,
@@ -2415,7 +2937,7 @@ function Schema:EncodeDelta(previous: {[string]: any}, current: {[string]: any},
 	local data =
 		finish(w)
 
-	return packetFromBuffer(
+	return packetFromEntropy(
 		data,
 		options,
 		self.Version,
@@ -2585,7 +3107,7 @@ end
 
 function Schema:PrintBitLayout(value: {[string]: any}): BitLayout
 	local layout = self:AnalyzeBits(value)
-	print("========== Compression v2.3.1 Bit Layout ==========")
+	print("========== Compression v2.5.5 Bit Layout ==========")
 	print("Header bits:", layout.HeaderBits)
 	for _, field in ipairs(layout.Fields) do
 		print(string.format(
@@ -5028,10 +5550,11 @@ function Compression.Encode(value: any, options: Options?): Packet
 
 	if kind == "buffer" then
 		local compactBuffer = Compression.CompressBuffer(value, options)
-		if Compression.BufferFrameVersion(compactBuffer) == 0 then
+		local plainBuffer = entropyDecodeIfNeeded(compactBuffer)
+		if Compression.BufferFrameVersion(plainBuffer) == 0 then
 			compactBuffer = bufferRawPacket(value)
 		end
-		return packetFromBuffer(compactBuffer, options, schemaVersion, buffer.len(value) * 8)
+		return packetFromEntropy(compactBuffer, options, schemaVersion, buffer.len(value) * 8)
 	end
 
 	if kind == "table"
@@ -5047,7 +5570,7 @@ function Compression.Encode(value: any, options: Options?): Packet
 				options
 			)
 
-		return packetFromBuffer(
+		return packetFromEntropy(
 			compactTable,
 			options,
 			schemaVersion,
@@ -5059,11 +5582,10 @@ function Compression.Encode(value: any, options: Options?): Packet
 
 	local atom = encodeCompactAtom(value, options)
 	if atom ~= nil then
-		local packet = packetFromBuffer(atom, options, schemaVersion, rawValueBits(value))
 		if kind == "boolean" then
-			return markBooleanPacket(packet)
+			return markBooleanPacket(packetFromBuffer(atom, options, schemaVersion, rawValueBits(value)))
 		end
-		return packet
+		return packetFromEntropy(atom, options, schemaVersion, rawValueBits(value))
 	end
 
 	assertNoCycles(value, {}, {})
@@ -5076,7 +5598,7 @@ function Compression.Encode(value: any, options: Options?): Packet
 
 	local data = finish(w)
 
-	return packetFromBuffer(
+	return packetFromEntropy(
 		data,
 		options,
 		schemaVersion,
@@ -5115,7 +5637,7 @@ function Compression.Decode(packet: Packet | buffer, options: Options?): any
 	if r.Length >= 2 and buffer.readu8(data, 0) == FMT.COMPACT_NUMBER_MAGIC then
 		readByte(r)
 		local compactVersion = readByte(r)
-		if compactVersion ~= FMT.VERSION and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
+		if compactVersion ~= FMT.VERSION and compactVersion ~= 23 and compactVersion ~= 22 and compactVersion ~= 21 and compactVersion ~= 20 and compactVersion ~= 19 and compactVersion ~= 18 and compactVersion ~= 17 and compactVersion ~= 16 and compactVersion ~= 15 and compactVersion ~= 14 and compactVersion ~= 13 and compactVersion ~= 12 and compactVersion ~= 11 and compactVersion ~= 10 and compactVersion ~= 9 and compactVersion ~= 8 and compactVersion ~= 7 then fail("unsupported compact number version", 2) end
 		local value = readNumberPayload(r)
 		if r.Position ~= r.Length then fail("trailing bytes in compact number payload", 2) end
 		return value
@@ -5390,6 +5912,11 @@ end
 
 function Compression.StringMode(data: buffer): string
 	if typeof(data) ~= "buffer" then return "Invalid" end
+	if isHuffmanFrame(data) then
+		local ok, decoded = pcall(huffmanDecodeFrame, data)
+		if not ok then return "Invalid" end
+		return "Huffman/" .. Compression.StringMode(decoded)
+	end
 	if buffer.len(data) == 0 then return "RawPassthrough" end
 	local mode = buffer.readu8(data, 0)
 	if mode > STR.RAW_V3 then return "RawPassthrough" end
@@ -5437,7 +5964,7 @@ end
 
 function Compression.PrintStringStats(value: string, options: Options?): {[string]: any}
 	local stats = Compression.StringStats(value, options)
-	print("========== Compression v2.3.1 String Stats ==========")
+	print("========== Compression v2.5.5 String Stats ==========")
 	print("Mode:", stats.Mode)
 	print("Raw:", stats.RawBytesText)
 	print("Encoded:", stats.EncodedBytesText)
@@ -5487,50 +6014,59 @@ end
 local function autoCodecFor(value: any, packet: Packet, options: Options?): string
 	if packet.Codec ~= nil then return packet.Codec end
 	local kind = typeof(value)
-	if kind == "buffer" then return "Buffer/" .. Compression.BufferMode(packet.Data) end
-	if kind == "number" then
-		local tag = buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) or -1
-		if tag == ATOM.DECIMAL then return "CompactDecimal" end
-		if tag == ATOM.FLOAT32 then return "CompactFloat32" end
-		return "CompactNumber"
+	local inspectData = packet.Data
+	local suffix = ""
+	if isHuffmanFrame(inspectData) then
+		local ok, decoded = pcall(huffmanDecodeFrame, inspectData)
+		if ok then
+			inspectData = decoded
+			suffix = "+Huffman"
+		end
 	end
-	if kind == "UDim" then return "CompactUDim" end
-	if kind == "UDim2" then return "CompactUDim2" end
-	if kind == "Rect" then return "CompactRect" end
-	if kind == "NumberRange" then return "CompactNumberRange" end
-	if kind == "BrickColor" then return "CompactBrickColor" end
-	if kind == "DateTime" then return "CompactDateTime" end
-	if kind == "table" then
-		if buffer.len(packet.Data) > 0 then
-			local first = buffer.readu8(packet.Data, 0)
-			if first == FMT.COMPACT_TABLE_MAGIC
-				or first == FMT.COMPACT_MAPPED_TABLE_MAGIC then
-				return "Table/" .. Compression.TableMode(packet.Data, options)
+
+	local base: string
+	if kind == "buffer" then
+		base = "Buffer/" .. Compression.BufferMode(packet.Data)
+		return base
+	elseif kind == "number" then
+		local tag = buffer.len(inspectData) > 0 and buffer.readu8(inspectData, 0) or -1
+		if tag == ATOM.DECIMAL then base = "CompactDecimal"
+		elseif tag == ATOM.FLOAT32 then base = "CompactFloat32"
+		else base = "CompactNumber" end
+	elseif kind == "UDim" then base = "CompactUDim"
+	elseif kind == "UDim2" then base = "CompactUDim2"
+	elseif kind == "Rect" then base = "CompactRect"
+	elseif kind == "NumberRange" then base = "CompactNumberRange"
+	elseif kind == "BrickColor" then base = "CompactBrickColor"
+	elseif kind == "DateTime" then base = "CompactDateTime"
+	elseif kind == "table" then
+		if buffer.len(inspectData) > 0 then
+			local first = buffer.readu8(inspectData, 0)
+			if first == FMT.COMPACT_TABLE_MAGIC or first == FMT.COMPACT_MAPPED_TABLE_MAGIC then
+				base = "Table/" .. Compression.TableMode(packet.Data, options)
+				return base
 			end
 		end
-		return "DynamicTable"
+		base = "DynamicTable"
+	elseif kind == "string" then base = "CompactString"
+	elseif kind == "boolean" then return "CompactBoolean1Bit"
+	elseif kind == "nil" then base = "CompactNil"
+	elseif kind == "Vector2" then
+		base = buffer.len(inspectData) > 0 and buffer.readu8(inspectData, 0) == ATOM.VECTOR2_F32 and "CompactVector2F32" or "CompactVector2"
+	elseif kind == "Vector3" then
+		base = buffer.len(inspectData) > 0 and buffer.readu8(inspectData, 0) == ATOM.VECTOR3_F32 and "CompactVector3F32" or "CompactVector3"
+	elseif kind == "Color3" then
+		local tag = buffer.len(inspectData) > 0 and buffer.readu8(inspectData, 0) or -1
+		if tag == ATOM.COLOR3_F32 then base = "CompactColor3F32"
+		elseif tag == ATOM.COLOR3_F64 then base = "CompactColor3F64"
+		else base = "CompactColor3" end
+	elseif kind == "CFrame" then
+		base = buffer.len(inspectData) > 0 and buffer.readu8(inspectData, 0) == ATOM.CFRAME_F32 and "CompactCFrameF32" or "CompactCFrame"
+	else
+		base = "Dynamic" .. kind
 	end
-	if kind == "string" then return "CompactString" end
-	if kind == "boolean" then return "CompactBoolean1Bit" end
-	if kind == "nil" then return "CompactNil" end
-	if kind == "Vector2" then
-		return buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == ATOM.VECTOR2_F32 and "CompactVector2F32" or "CompactVector2"
-	end
-	if kind == "Vector3" then
-		return buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == ATOM.VECTOR3_F32 and "CompactVector3F32" or "CompactVector3"
-	end
-	if kind == "Color3" then
-		local tag = buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) or -1
-		if tag == ATOM.COLOR3_F32 then return "CompactColor3F32" end
-		if tag == ATOM.COLOR3_F64 then return "CompactColor3F64" end
-		return "CompactColor3"
-	end
-	if kind == "CFrame" then
-		return buffer.len(packet.Data) > 0 and buffer.readu8(packet.Data, 0) == ATOM.CFRAME_F32 and "CompactCFrameF32" or "CompactCFrame"
-	end
-	return "Dynamic" .. kind
+	return base .. suffix
 end
-
 local function dynamicTablePacket(value: {[any]: any}, options: Options?): Packet
 	local dynamicOptions = options and table.clone(options) or {}
 	dynamicOptions.TableStrategy = "Dynamic"
@@ -5556,7 +6092,7 @@ local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Pack
 			)
 
 		if compactOK then
-			return packetFromBuffer(
+			return packetFromEntropy(
 				compactData,
 				options,
 				options and options.SchemaVersion or 1,
@@ -5592,7 +6128,7 @@ local function adaptiveTablePacket(value: {[any]: any}, options: Options?): Pack
 		return dynamicPacket
 	end
 
-	local compactPacket = packetFromBuffer(
+	local compactPacket = packetFromEntropy(
 		compactData,
 		options,
 		options and options.SchemaVersion or 1,
@@ -5679,9 +6215,15 @@ end
 
 function Compression.PrintAutoStats(value: any, options: Options?): {[string]: any}
 	local stats = Compression.AutoStats(value, options)
-	print("========== Compression v2.3.1 Auto Stats ==========")
+	print("========== Compression v2.5.5 Auto Stats ==========")
 	print("Type:", stats.ValueType)
 	print("Codec:", stats.Codec)
+	if stats.Entropy ~= nil then
+		print("Entropy:", stats.Entropy)
+		if stats.Entropy == "Huffman" then
+			print("Huffman bytes:", stats.EntropyBytesBefore, "->", stats.EntropyBytesAfter)
+		end
+	end
 	print("Raw:", stats.RawBytesText or "Unknown")
 	print("Encoded:", stats.EncodedBytesText)
 	if stats.UsefulBits ~= nil
@@ -5711,15 +6253,18 @@ function Compression.PrintAutoStats(value: any, options: Options?): {[string]: a
 	return stats
 end
 
-function Compression.CompressNumber(value: number): buffer
+function Compression.CompressNumber(value: number, options: Options?): buffer
 	if typeof(value) ~= "number" then fail("CompressNumber expects number", 2) end
 	local w = newWriter(16)
 	writeNumberPayload(w, value)
-	return finish(w)
+	local data = finish(w)
+	local encoded = maybeHuffman(data, options)
+	return encoded
 end
 
 function Compression.DecompressNumber(data: buffer): number
 	if typeof(data) ~= "buffer" then fail("DecompressNumber expects buffer", 2) end
+	data = entropyDecodeIfNeeded(data)
 	local r = newReader(data)
 	local value = readNumberPayload(r)
 	if r.Position ~= r.Length then fail("trailing bytes in number payload", 2) end
@@ -6303,7 +6848,7 @@ end
 
 function Compression.PrintTableStats(value: {[any]: any}, options: Options?): {[string]: any}
 	local stats = Compression.TableStats(value, options)
-	print("========== Compression v2.3.1 Table Stats ==========")
+	print("========== Compression v2.5.5 Table Stats ==========")
 	print("Mode:", stats.Mode)
 	print("Format:", stats.Format)
 	print("Kind:", stats.Kind)
@@ -6447,6 +6992,10 @@ function Compression.Stats(packet: Packet | buffer): {[string]: any}
 		ValueType = packet.ValueType,
 		Codec = packet.Codec,
 		Passthrough = packet.Passthrough == true,
+		Entropy = packet.Entropy,
+		EntropyBytesBefore = packet.EntropyBytesBefore,
+		EntropyBytesAfter = packet.EntropyBytesAfter,
+		EntropySavedBytes = packet.EntropySavedBytes or 0,
 	}
 end
 
@@ -6509,7 +7058,7 @@ function Compression.Codec(value: any, options: Options?): string
 end
 
 function Compression.Version(): string
-	return "2.3.1"
+	return "2.5.5"
 end
 
 return Compression
