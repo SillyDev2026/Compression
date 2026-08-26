@@ -1,12 +1,12 @@
 # Compression
 
-**Current version: v2.3.2**  
-**Binary format: 22**  
-**Public API: 80 functions**
+**Current version: v2.5.5**  
+**Binary format: 24**  
+**Public API: 85 functions**
 
-Compression is a binary serialization and compression library for Roblox/Luau focused on compact payloads, predictable round trips, low overhead, and practical game-data serialization.
+Compression is a type-aware binary serialization and compression library for Roblox/Luau focused on compact payloads, predictable round trips, expansion-safe codec selection, and practical game-data/network serialization.
 
-It supports primitive values, Roblox datatypes, strings, buffers, arrays, maps, nested tables, schemas, delta packets, repeated-string dictionaries, table-key mapping, integrity hashes, bit-layout analysis, and adaptive codec selection.
+It supports primitive values, Roblox datatypes, strings, buffers, arrays, maps, nested tables, schemas, delta packets, repeated-string dictionaries, table-key mapping, canonical Huffman entropy coding, integrity hashes, bit-layout analysis, and adaptive codec selection.
 
 The main rule of the library is:
 
@@ -37,6 +37,7 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - [Number Compression](#number-compression)
 - [String Compression](#string-compression)
 - [Buffer Compression](#buffer-compression)
+- [Huffman Entropy Coding](#huffman-entropy-coding)
 - [Roblox Datatypes](#roblox-datatypes)
 - [Table Compression](#table-compression)
 - [Table Key Mapping](#table-key-mapping)
@@ -50,7 +51,7 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - [Statistics and Analysis](#statistics-and-analysis)
 - [Configuration](#configuration)
 - [Backward Compatibility](#backward-compatibility)
-- [v2.3.2 Patch Notes](#v232-patch-notes)
+- [v2.5.5 Patch Notes](#v255-patch-notes)
 - [Version](#version)
 - [Download](#download)
 
@@ -70,6 +71,9 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - Exact compact decimal representation
 - Exact Float32 selection when safe
 - Raw fallback when smaller compression is unavailable
+- Canonical Huffman entropy coding with Auto selection
+- Huffman expansion rejection when the full frame is not smaller
+- Direct `HuffmanEncode`, `HuffmanDecode`, `TryHuffman`, `IsHuffman`, and `HuffmanStats` APIs
 - String codecs:
   - Raw
   - Numeric4
@@ -109,7 +113,9 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - Useful-bit vs physical-bit statistics
 - Bit-layout analysis
 - Malformed payload and allocation guards
-- Backward decoding support for compatible older formats
+- Backward decoding support for compatible older binary formats
+- Legacy short `SparsePower2` recovery and malformed-padding validation
+- Top-level buffer type preservation through entropy framing
 - Reduced top-level Luau register pressure
 
 ---
@@ -196,7 +202,7 @@ local value = Compression.Unpack(packet)
 
 # Pack and Unpack
 
-`Pack()` is the recommended high-level call in v2.3.x.
+`Pack()` is the recommended high-level call in v2.5.x.
 
 ```lua
 local packet = Compression.Pack(value)
@@ -304,7 +310,7 @@ if not ok then
 end
 ```
 
-The v2.3.x `Try*` APIs return useful error text:
+The v2.5.x `Try*` APIs return useful error text:
 
 ```text
 success, value, nil
@@ -330,193 +336,95 @@ Compression.TryDecompressTable(...)
 
 # Real Compression Examples
 
-The following examples come from the v2.3.2 Studio type/regression test.
+The following measurements come from the **Compression v2.5.5 full Huffman/regression suite**.
 
-Compression ratios are input-dependent. They are examples, not guaranteed ratios for every value.
-
-The v2.3.2 regression suite completed with **75 tests passed** and **Status: ALL PASSED**. The release primarily improves correctness, fallback behavior, metadata accuracy, and edge-case handling while preserving the strong compression ratios of v2.3.1.
+Compression ratios are input-dependent. These are measured examples, not guaranteed ratios for every value. v2.5.5 completed **122 tests passed, 0 failed, 0 skipped**.
 
 ## Primitive numbers
 
-| Value | Raw | Compressed | Saved | Savings |
+| Value | Raw | Encoded | Saved | Savings |
 | --- | ---: | ---: | ---: | ---: |
 | `0` | 8 B | **1 B** | 7 B | **87.50%** |
 | `1` | 8 B | **1 B** | 7 B | **87.50%** |
 | `-1` | 8 B | **1 B** | 7 B | **87.50%** |
 | `100` | 8 B | **2 B** | 6 B | **75.00%** |
+| `128` | 8 B | **3 B** | 5 B | **62.50%** |
 | `1_000_000` | 8 B | **2 B** | 6 B | **75.00%** |
 | `-123456` | 8 B | **4 B** | 4 B | **50.00%** |
-| `123.456789` | 8 B | **6 B** | 2 B | **25.00%** |
+| `123.125` | 8 B | **5 B** | 3 B | **37.50%** |
 | `1e100` | 8 B | **3 B** | 5 B | **62.50%** |
-| `0.000001` | 8 B | **2 B** | 6 B | **75.00%** |
 
-For example:
-
-```lua
-local packet =
-	Compression.Pack(0)
-
-print(packet.Codec)
-print(packet.Bytes)
-print(packet.Bits)
-```
-
-Example result:
-
-```text
-Codec: CompactNumber
-
-RAW
-Bytes: 8 B
-Bits: 64 b
-
-COMPRESSED
-Bytes: 1 B
-Bits: 8 b
-
-Saved: 7 B
-Savings: 87.50%
-
-Returned Value: 0
-Exact Match: true
-```
-
----
+Arbitrary Float64 values such as `math.pi` can remain at 8 bytes when no exact smaller representation exists. Compression does not silently reduce precision.
 
 ## Strings
 
-| Example | Mode | Raw | Compressed | Savings |
+| Example | Selected mode | Raw | Encoded | Approx. savings |
 | --- | --- | ---: | ---: | ---: |
-| 30-digit numeric string | `Numeric4` | 30 B | **17 B** | **43.33%** |
-| Identifier-style string | `Identifier6` | 38 B | **31 B** | **18.42%** |
-| ASCII sentence | `ASCII7` | 47 B | **44 B** | **6.38%** |
-| Repetitive 400 B string | `LZ-v2` | 400 B | **26 B** | **93.50%** |
-| Auto repetitive 900 B string | `LZ-v2` | 900 B | **47 B** | **94.78%** |
-
-Example:
-
-```lua
-local value =
-	string.rep(
-		"HelloWorld",
-		40
-	)
-
-local compressed =
-	Compression.CompressString(value)
-
-print(
-	Compression.StringMode(
-		compressed
-	)
-)
-```
-
-A repetitive test string compressed from:
-
-```text
-400 B -> 26 B
-```
-
-using `LZ-v2`.
-
----
+| Numeric text | `Numeric4` | 40 B | **22 B** | **45.00%** |
+| Identifier-style text | `Identifier6` | 49 B | **39 B** | **20.41%** |
+| ASCII text | `ASCII7` | 84 B | **76 B** | **9.52%** |
+| Repetitive string | `Huffman/LZ-v2` | 1,280 B | **51 B** | **96.02%** |
+| Large repetitive string | `Huffman/LZ-v2` | 3,712 B | **107 B** | **97.12%** |
+| Huffman-skewed raw text | `Huffman/RawPassthrough` | 9,200 B | **1,315 B** | **85.71%** |
 
 ## Buffers
 
-| Buffer | Selected mode | Raw | Compressed | Savings |
+| Buffer | Selected mode | Raw | Encoded | Approx. savings |
 | --- | --- | ---: | ---: | ---: |
-| 100 zero bytes | `Zero` | 100 B | **3 B** | **97.00%** |
-| 100 copies of one byte | `Fill` | 100 B | **4 B** | **96.00%** |
-| Sparse zero buffer | `SparseZero` | 64 B | **15 B** | **76.56%** |
-| Sparse power-of-two buffer | `SparsePower2` | 64 B | **14 B** | **78.12%** |
-| Repetitive binary pattern | `LZ` | 512 B | **53 B** | **89.65%** |
-| Random/high-entropy buffer | `RawPassthrough` | 256 B | **256 B** | 0% |
+| Zero buffer | `Zero` | 512 B | **4 B** | **99.22%** |
+| One-byte fill | `Fill` | 512 B | **5 B** | **99.02%** |
+| Sparse zero | `Huffman/SparseZero` | 256 B | **38 B** | **85.16%** |
+| Sparse powers-of-two | `Huffman/SparsePower2` | 256 B | **35 B** | **86.33%** |
+| Nibble-compatible | `Huffman/Nibble4` | 512 B | **136 B** | **73.44%** |
+| Repetitive binary | `Huffman/LZ` | 4,096 B | **142 B** | **96.53%** |
+| Huffman-skewed raw bytes | `Huffman/RawPassthrough` | 8,192 B | **1,243 B** | **84.83%** |
+| Random/high-entropy | `RawPassthrough` | 2,048 B | **2,048 B** | 0% |
 
-The final row is intentional.
-
-Compression does not force a larger representation when the bytes are already effectively incompressible.
-
----
+The random-buffer result is intentional: `Auto` rejects candidates that would expand the payload.
 
 ## Roblox datatypes
 
-| Type | Raw estimate | Compressed | Savings |
+| Type | Raw estimate | Encoded | Savings |
 | --- | ---: | ---: | ---: |
-| `Vector2` | 16 B | **9 B** | **43.75%** |
-| `Vector3` | 24 B | **9 B** | **62.50%** |
-| `Color3` | 12 B | **4 B** | **66.67%** |
+| `Vector2.new(12.5, -8.25)` | 16 B | **9 B** | **43.75%** |
+| `Vector3.new(100, 0, -25.5)` | 24 B | **8 B** | **66.67%** |
+| RGB8-compatible `Color3` | 12 B | **4 B** | **66.67%** |
 | position-only `CFrame` | 96 B | **18 B** | **81.25%** |
 | rotated `CFrame` | 96 B | **48 B** | **50.00%** |
+| `UDim2` example | 24 B | **7 B** | **70.83%** |
+| `Rect` example | 32 B | **15 B** | **53.12%** |
+| `NumberRange` example | 16 B | **8 B** | **50.00%** |
 
-A simple Auto `Vector3.new(1, 2, 3)` test reached:
+## Arrays and tables
 
-```text
-24 B -> 6 B
-75.00% saved
-```
+These values use the test suite's raw-size estimate for the original logical data.
 
-A simple Auto `CFrame.new(1, 2, 3)` test reached:
+| Value | Raw estimate / no-entropy | v2.5.5 Auto | Selected path |
+| --- | ---: | ---: | --- |
+| Boolean array | 2,313 B | **34 B** | `CompactBoolArray` + entropy frame |
+| UInt delta array | 8,192 B | **93 B** | `CompactUIntDeltaArray` + Huffman |
+| Int delta array | 8,192 B | **88 B** | `CompactIntDeltaArray` + Huffman |
+| Float32 array | 8,192 B | **546 B** | `CompactFloat32Array` + Huffman |
+| String array | 6,707 B | **208 B** | RLE/dynamic + Huffman |
+| Vector3 array | 8,192 B | **697 B** | `Vector3F32Array` + Huffman |
+| Color3 array | 5,120 B | **144 B** | `Color3RGB8Array` + Huffman |
+| DateTime array | 2,048 B | **527 B** | `DateTimeArray` + Huffman |
+| Repeated numeric array | 4,800 B | **10 B** | `CompactRLEArray` |
 
-```text
-96 B -> 15 B
-84.38% saved
-```
-
-Different component values can choose different internal number representations, so sizes vary.
-
----
-
-## Arrays
-
-| Array type | Mode | Raw estimate | Compressed | Savings |
-| --- | --- | ---: | ---: | ---: |
-| booleans | `CompactBoolArray` | 54 B | **3 B** | **94.44%** |
-| UInt array | `CompactUIntArray` | 160 B | **12 B** | **92.50%** |
-| Int array | `CompactIntArray` | 176 B | **14 B** | **92.05%** |
-| exact Float32 array | `CompactFloat32Array` | 64 B | **19 B** | **70.31%** |
-| repeated string array | `CompactRLEArray` | 72 B | **15 B** | **79.17%** |
-| repeated numeric array | `CompactRLEArray` | 160 B | **14 B** | **91.25%** |
-| sequential UInt array | `CompactUIntDeltaArray` | 112 B | **11 B** | **90.18%** |
-
----
-
-## Tables
-
-| Table | Mode | Raw estimate | Compressed | Savings |
-| --- | --- | ---: | ---: | ---: |
-| `{man = 1, exp = 3}` | `CompactStringMap` | 22 B | **12 B** | **45.45%** |
-| player data map | `CompactStringMap` | 60 B | **42 B** | **30.00%** |
-| mixed table | `CompactStringMap` | 166 B | **68 B** | **59.04%** |
-| nested player data | `CompactStringMap` | 139 B | **95 B** | **31.65%** |
-| table containing buffer | `CompactStringMap` | 91 B | **38 B** | **58.24%** |
-| table containing Roblox types | `CompactStringMap` | 179 B | **105 B** | **41.34%** |
-
-Example:
-
-```lua
-local data = {
-	Coins = 1000,
-	Rebirths = 10,
-	Enabled = true,
-}
-
-local packet =
-	Compression.Pack(data)
-
-print(packet.Codec)
-print(packet.Bytes)
-```
-
-One measured Auto test produced:
+A representative nested player-data table measured:
 
 ```text
-Codec: Table/CompactStringMap
+Entropy=None: 1311 B
+Auto/Huffman:  759 B
+Saved:         552 B
+```
 
-Raw:        37 B
-Compressed: 25 B
-Saved:      12 B
-Savings:    32.43%
+A representative schema measured:
+
+```text
+Entropy=None: 1939 B
+Auto/Huffman: 1691 B
+Entropy saved: 248 B
 ```
 
 ---
@@ -526,59 +434,53 @@ Savings:    32.43%
 Adaptive calls return a packet table.
 
 ```lua
-local packet =
-	Compression.Pack(value)
+local packet = Compression.Pack(value)
 ```
 
-Common fields:
+Common fields include:
 
 ```lua
-print(packet.Data)
-print(packet.Bytes)
-print(packet.Bits)
+packet.Data
+packet.Bytes
+packet.Bits
+packet.RawBytes
+packet.RawBits
+packet.SavedBytes
+packet.ExpandedBytes
+packet.ByteDelta
+packet.SavedBits
+packet.ExpandedBits
+packet.BitDelta
+packet.UsefulBits
+packet.PhysicalBits
+packet.PaddingBits
+packet.ValueType
+packet.Codec
+packet.Ratio
+packet.SavingsPercent
+packet.ExpansionPercent
+packet.BitSavingsPercent
+packet.BitExpansionPercent
+packet.IsSmaller
+packet.IsPhysicallySmaller
+packet.IsBitSmaller
 
-print(packet.RawBytes)
-print(packet.RawBits)
-
-print(packet.SavedBytes)
-print(packet.ExpandedBytes)
-print(packet.ByteDelta)
-
-print(packet.SavedBits)
-print(packet.ExpandedBits)
-print(packet.BitDelta)
-
-print(packet.UsefulBits)
-print(packet.PhysicalBits)
-print(packet.PaddingBits)
-
-print(packet.ValueType)
-print(packet.Codec)
-
-print(packet.Ratio)
-print(packet.SavingsPercent)
-print(packet.ExpansionPercent)
-print(packet.BitSavingsPercent)
-print(packet.BitExpansionPercent)
-
-print(packet.IsSmaller)
-print(packet.IsPhysicallySmaller)
-print(packet.IsBitSmaller)
+-- v2.4+ entropy metadata
+packet.Entropy
+packet.EntropyBytesBefore
+packet.EntropyBytesAfter
+packet.EntropySavedBytes
 ```
+
+`packet.Entropy` is typically `"Huffman"`, `"None"`, or `nil`/not applicable depending on the selected path.
 
 Not every field is meaningful for every packet, so some metadata can be `nil`.
 
-v2.3.2 makes byte-level and bit-level accounting explicit. `ByteDelta` compares physical encoded bytes with the raw byte estimate, while `BitDelta` compares useful encoded bits with the raw bit estimate. This prevents bit-packing wins from being reported as physical byte savings when the final `buffer` still occupies the same number of bytes.
-
----
+v2.5.5 keeps byte-level and bit-level accounting separate. `ByteDelta` compares physical encoded bytes with the raw byte estimate, while `BitDelta` compares useful encoded bits with the raw bit estimate.
 
 ## Useful Bits vs Physical Bits
 
-Roblox `buffer` storage is byte-addressed.
-
-A standalone boolean therefore still physically occupies at least one byte even though only one bit is meaningful.
-
-For example:
+Roblox `buffer` storage is byte-addressed. A standalone boolean therefore still physically occupies at least one byte even though only one bit is meaningful.
 
 ```text
 Raw boolean:
@@ -587,18 +489,10 @@ Raw boolean:
 Compressed boolean:
 1 useful bit
 8 physical bits
-7 unused physical bits
+7 padding bits
 ```
 
-The v2.3.x metadata keeps these concepts separate:
-
-```lua
-packet.UsefulBits
-packet.PhysicalBits
-packet.PaddingBits
-```
-
-This is especially useful for bit-packed tables and schemas.
+Boolean arrays benefit much more because many boolean values share the same bytes. Booleans intentionally bypass Huffman because a binary alphabet is already represented at one useful bit per value in the compact path.
 
 ---
 
@@ -799,26 +693,17 @@ A measured `1e100` result:
 Use:
 
 ```lua
-local compressed =
-	Compression.CompressString(value)
-
-local restored =
-	Compression.DecompressString(
-		compressed
-	)
+local compressed = Compression.CompressString(value)
+local restored = Compression.DecompressString(compressed)
 ```
 
 Inspect the selected mode:
 
 ```lua
-print(
-	Compression.StringMode(
-		compressed
-	)
-)
+print(Compression.StringMode(compressed))
 ```
 
-Current strategies:
+Current string strategies:
 
 ```text
 Auto
@@ -829,154 +714,47 @@ ASCII7
 LZ
 ```
 
----
+The selected first-stage string codec can then be Huffman-coded when entropy coding is enabled and the final Huffman frame is smaller.
 
 ## Raw
 
-Force raw string handling:
-
-```lua
-local compressed =
-	Compression.CompressString(
-		value,
-		{
-			StringStrategy = "Raw",
-		}
-	)
-```
-
-Depending on the bytes, Raw may be a direct passthrough or framed raw representation.
-
----
+Keeps the original bytes when specialized codecs would not help. Raw payloads are protected against accidental `HUF1` frame-signature collisions.
 
 ## Numeric4
 
-Optimized for numeric text containing:
-
-```text
-0-9
-+
--
-.
-e
-E
-```
-
-Example:
-
-```lua
-local compressed =
-	Compression.CompressString(
-		"123456789012345678901234567890",
-		{
-			StringStrategy = "Numeric4",
-		}
-	)
-```
-
-Measured:
-
-```text
-30 B -> 17 B
-43.33% saved
-```
-
----
+Optimized for numeric text using the supported numeric alphabet. In the v2.5.5 suite, a 40-byte numeric string encoded to 22 bytes.
 
 ## Identifier6
 
-Optimized for identifier-like strings using:
-
-```text
-A-Z
-a-z
-0-9
-_
--
-```
-
-Example:
-
-```text
-PlayerData_Coins_Rebirths_Level_123456
-```
-
-Measured:
-
-```text
-38 B -> 31 B
-18.42% saved
-```
-
----
+Optimized for identifier-style strings such as player keys, stat names, and compact IDs. A 49-byte test encoded to 39 bytes.
 
 ## ASCII7
 
-Stores compatible characters using 7-bit symbols.
-
-Measured example:
-
-```text
-47 B -> 44 B
-6.38% saved
-```
-
----
+Stores compatible ASCII characters using seven-bit symbols. An 84-byte test encoded to 76 bytes.
 
 ## LZ
 
-Useful for repeated text:
-
-```lua
-local value =
-	string.rep(
-		"PlayerDataCoins",
-		64
-	)
-
-local compressed =
-	Compression.CompressString(
-		value
-	)
-```
+LZ is the main repeated-sequence string codec. Huffman can then entropy-code the LZ representation.
 
 Measured examples:
 
 ```text
-400 B -> 26 B
-93.50% saved
+1280 B -> 51 B   Huffman/LZ-v2
+3712 B -> 107 B  Huffman/LZ-v2
 ```
-
-and:
-
-```text
-900 B -> 47 B
-94.78% saved
-```
-
----
 
 ## String statistics
 
 ```lua
-local stats =
-	Compression.StringStats(value)
-
+local stats = Compression.StringStats(value)
 print(stats.Mode)
 print(stats.RawBytes)
 print(stats.Bytes)
 print(stats.SavedBytes)
 print(stats.ExpandedBytes)
 print(stats.SavingsPercent)
-print(stats.ExpansionPercent)
-```
 
-Formatted report:
-
-```lua
-Compression.PrintStringStats(
-	value
-)
+Compression.PrintStringStats(value)
 ```
 
 ---
@@ -986,33 +764,15 @@ Compression.PrintStringStats(
 Use:
 
 ```lua
-local compressed =
-	Compression.CompressBuffer(value)
-
-local restored =
-	Compression.DecompressBuffer(
-		compressed
-	)
+local compressed = Compression.CompressBuffer(value)
+local restored = Compression.DecompressBuffer(compressed)
 ```
 
-Mode:
+Inspect the selected representation:
 
 ```lua
-print(
-	Compression.BufferMode(
-		compressed
-	)
-)
-```
-
-Frame version:
-
-```lua
-print(
-	Compression.BufferFrameVersion(
-		compressed
-	)
-)
+print(Compression.BufferMode(compressed))
+print(Compression.BufferFrameVersion(compressed))
 ```
 
 Current buffer strategies:
@@ -1025,207 +785,167 @@ Sparse
 Nibble
 ```
 
-Current output modes include:
+Current first-stage output modes include:
 
 | Mode | Purpose |
 | --- | --- |
-| `RawPassthrough` | Keeps original bytes when compression is not smaller |
+| `RawPassthrough` | Keep original bytes when nothing smaller exists |
 | `Raw` | Framed raw representation |
 | `Zero` | All bytes are zero |
 | `Fill` | One repeated byte |
-| `SparseZero` | Mostly zero bytes |
+| `SparseZero` | Mostly-zero buffers |
 | `SparsePower2` | Sparse powers-of-two values |
 | `Nibble4` | Values fit in low four bits |
 | `NibbleHigh4` | Values fit in high four bits |
 | `LZ` | Repeated binary sequences |
 
----
+After the first-stage codec, canonical Huffman can be selected automatically when it produces a smaller complete frame.
 
-## Zero buffers
+## Auto selection
+
+`Auto` compares available representations and keeps the smallest safe result. It does not force compression merely because a codec is valid.
+
+Measured v2.5.5 examples:
+
+```text
+Zero:              512 B ->    4 B
+Fill:              512 B ->    5 B
+SparseZero:        256 B ->   38 B  with Huffman
+SparsePower2:      256 B ->   35 B  with Huffman
+Nibble4:           512 B ->  136 B  with Huffman
+LZ pattern:       4096 B ->  142 B  with Huffman
+Huffman skew:     8192 B -> 1243 B
+Random:           2048 B -> 2048 B  RawPassthrough
+```
+
+## Small and high-entropy buffers
+
+A small buffer can legitimately remain unchanged.
+
+For example, a 12-byte buffer containing one `i8`, three padding zeros, and an arbitrary Float64 may report:
+
+```text
+Type: buffer
+Codec: PassthroughBuffer
+Raw: 12 B
+Encoded: 12 B
+Saved: 0 B
+Savings: 0.00%
+Ratio: 1.0000x
+```
+
+This is expected. The Float64 bytes can have high entropy, while LZ, Sparse, Nibble, and Huffman framing each add metadata. The default `HuffmanMinBytes` is 16, so `Auto` does not attempt per-packet Huffman on a 12-byte candidate by default.
+
+If the layout is known ahead of time, prefer a Schema or typed representation instead of first serializing the fields into an opaque padded buffer. Schemas can omit repeated type metadata and avoid transmitting application-level padding entirely.
+
+## Expansion safety
+
+With `AllowExpansion = false`, forced LZ and Auto paths can fall back to raw when their encoded representation would be larger.
 
 ```lua
-local value =
-	buffer.create(100)
-
-local compressed =
-	Compression.CompressBuffer(
-		value
-	)
+local compressed = Compression.CompressBuffer(value, {
+    BufferStrategy = "LZ",
+    AllowExpansion = false,
+})
 ```
 
-Measured:
-
-```text
-100 B -> 3 B
-97.00% saved
-```
-
----
-
-## Fill buffers
-
-```lua
-local value =
-	buffer.create(100)
-
-buffer.fill(
-	value,
-	0,
-	123
-)
-
-local compressed =
-	Compression.CompressBuffer(
-		value
-	)
-```
-
-Measured:
-
-```text
-100 B -> 4 B
-96.00% saved
-```
-
----
-
-## SparseZero
-
-```lua
-local value =
-	buffer.create(64)
-
-buffer.writeu8(value, 0, 25)
-buffer.writeu8(value, 20, 50)
-buffer.writeu8(value, 40, 75)
-buffer.writeu8(value, 63, 100)
-```
-
-Measured:
-
-```text
-64 B -> 15 B
-76.56% saved
-```
-
----
-
-## SparsePower2
-
-Optimized for sparse values such as:
-
-```text
-1
-2
-4
-8
-16
-32
-64
-128
-```
-
-Measured:
-
-```text
-64 B -> 14 B
-78.12% saved
-```
-
----
-
-## Nibble4
-
-Nibble4 targets byte values in:
-
-```text
-0 - 15
-```
-
-Two four-bit values can share one byte.
-
----
-
-## NibbleHigh4
-
-Targets:
-
-```text
-0
-16
-32
-48
-...
-240
-```
-
----
-
-## Auto can beat a forced mode
-
-If a nibble-compatible buffer is also highly repetitive, Auto may choose LZ because the final LZ result is smaller.
-
-This is expected.
-
-The compressor is trying to minimize the final payload, not merely choose the first valid specialized codec.
-
----
-
-## LZ buffers
-
-Repeated binary structures can compress heavily.
-
-Measured:
-
-```text
-512 B -> 53 B
-89.65% saved
-```
-
----
-
-## Random data
-
-Random or encrypted-looking data may not compress.
-
-Measured example:
-
-```text
-Raw:        256 B
-Compressed: 256 B
-Mode:       RawPassthrough
-```
-
-That is preferable to expanding the payload.
-
----
+Set `AllowExpansion = true` only when you deliberately want to inspect or benchmark a forced codec even when it becomes larger.
 
 ## Buffer statistics
 
 ```lua
-local stats =
-	Compression.BufferStats(value)
-
+local stats = Compression.BufferStats(value)
 print(stats.Mode)
 print(stats.RawBytes)
 print(stats.Bytes)
 print(stats.SavedBytes)
 print(stats.ExpandedBytes)
+
+Compression.PrintBufferStats(value)
 ```
 
-Formatted output:
+---
+
+# Huffman Entropy Coding
+
+v2.5.5 includes a **canonical Huffman** entropy layer. It is a second-stage codec: Compression first applies the best type-aware representation, then Huffman may reduce that byte stream further.
+
+Typical pipeline:
+
+```text
+value
+  -> type-aware codec
+  -> VarInt / delta / RLE / LZ / sparse / nibble / compact table
+  -> canonical Huffman when profitable
+  -> final buffer
+```
+
+Huffman is lossless. It does not quantize arbitrary floats and cannot recover information removed by a lossy transform.
+
+## Auto behavior
+
+Default entropy behavior is expansion-safe:
 
 ```lua
-Compression.PrintBufferStats(
-	value
-)
+{
+    EntropyCoding = true,
+    EntropyStrategy = "Auto",
+    HuffmanMinBytes = 16,
+    HuffmanMinSavings = 1,
+    HuffmanMaxCodeBits = 32,
+}
 ```
+
+`Auto` includes the Huffman codebook/frame overhead in its comparison. If the complete Huffman frame is not smaller enough, the original first-stage representation is kept.
+
+Random data therefore commonly stays uncompressed.
+
+## Direct Huffman API
+
+```lua
+local frame = Compression.HuffmanEncode(data)
+local restored = Compression.HuffmanDecode(frame)
+
+print(Compression.IsHuffman(frame))
+```
+
+Try Huffman only when it wins:
+
+```lua
+local result, selected = Compression.TryHuffman(data)
+```
+
+Statistics:
+
+```lua
+local stats = Compression.HuffmanStats(data)
+print(stats.Selected)
+print(stats.RawBytes)
+print(stats.Bytes)
+print(stats.SavedBytes)
+print(stats.SavingsPercent)
+```
+
+## Forced Huffman
+
+```lua
+local result, selected = Compression.TryHuffman(data, {
+    EntropyStrategy = "Huffman",
+    AllowExpansion = false,
+})
+```
+
+With `AllowExpansion = false`, forced Huffman still returns the original representation when the Huffman frame would be larger. Set `AllowExpansion = true` for codec stress tests or direct expansion measurements.
+
+## Boolean exception
+
+Standalone booleans and compact boolean data do not need per-value Huffman coding. The compact boolean path already uses one useful bit per boolean. Huffman remains useful around larger structured byte streams that happen to contain a bit-packed boolean array because it can compress the surrounding structural bytes, not because it can represent an individual boolean below one bit.
 
 ---
 
 # Roblox Datatypes
 
-Compression v2.3.2 supports these Roblox datatypes directly:
+Compression v2.5.5 supports these Roblox datatypes directly:
 
 ```text
 Vector2
@@ -1542,7 +1262,7 @@ local packet =
 	)
 ```
 
-If a value cannot be represented by the Compact format, v2.3.x can fall back to Dynamic instead of breaking the entire table encode.
+If a value cannot be represented by the Compact format, v2.5.x can fall back to Dynamic instead of breaking the entire table encode.
 
 ---
 
@@ -1906,7 +1626,7 @@ Disable it:
 UseStringDictionary = false
 ```
 
-v2.3.2 rejects malformed payloads containing duplicate dictionary entries.
+v2.5.5 rejects malformed payloads containing duplicate dictionary entries.
 
 ---
 
@@ -2004,7 +1724,7 @@ Measured:
 41.34% saved
 ```
 
-Newer v2.3.x Dynamic tables also support:
+Newer v2.5.x Dynamic tables also support:
 
 ```text
 UDim
@@ -2121,7 +1841,7 @@ Schema packets carry the schema version and reject incompatible schema versions.
 
 # Descriptor API
 
-v2.3.2 includes the following descriptor constructors:
+v2.5.5 includes the following descriptor constructors:
 
 | Descriptor | Purpose |
 | --- | --- |
@@ -2152,7 +1872,7 @@ v2.3.2 includes the following descriptor constructors:
 
 ## Lossless Color3 schema descriptor
 
-v2.3.x fixed the older schema Color3 behavior.
+v2.5.x fixed the older schema Color3 behavior.
 
 The schema descriptor now adaptively chooses an exact representation:
 
@@ -2198,7 +1918,7 @@ Schema:Encode({
 })
 ```
 
-Required fields cannot be silently removed by a delta packet in v2.3.2.
+Required fields cannot be silently removed by a delta packet in v2.5.5.
 
 ---
 
@@ -2260,7 +1980,7 @@ local restored =
 	)
 ```
 
-v2.3.2 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
+v2.5.5 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
 
 ---
 
@@ -2286,7 +2006,7 @@ local descriptor =
 	)
 ```
 
-v2.3.x recognizes:
+v2.5.x recognizes:
 
 ```text
 UDim
@@ -2359,7 +2079,7 @@ local Position =
 	)
 ```
 
-The constructors validate invalid ranges in v2.3.x.
+The constructors validate invalid ranges in v2.5.x.
 
 ---
 
@@ -2593,55 +2313,67 @@ Common options:
 
 ```lua
 {
-	Mode = "Binary",
+    Mode = "Binary",
 
-	CompressStrings = true,
-	StringMinLength = 16,
-	StringStrategy = "Auto",
-	StringSearchDepth = 24,
-	StringWindowSize = 16383,
-	StringMaxMatch = 66,
+    CompressStrings = true,
+    StringMinLength = 16,
+    StringStrategy = "Auto",
+    StringSearchDepth = 24,
+    StringWindowSize = 16383,
+    StringMaxMatch = 66,
 
-	UseStringDictionary = true,
-	DictionaryMinUses = 2,
-	MaxDictionaryEntries = 255,
+    UseStringDictionary = true,
+    DictionaryMinUses = 2,
+    MaxDictionaryEntries = 255,
 
-	TableCompression = true,
-	HomogeneousArrays = true,
-	DeltaArrays = true,
-	RunLengthArrays = true,
-	CompactMapKeys = true,
+    TableCompression = true,
+    HomogeneousArrays = true,
+    DeltaArrays = true,
+    RunLengthArrays = true,
+    CompactMapKeys = true,
 
-	TableKeyMapping = true,
-	MappedKeyMinUses = 2,
-	MaxMappedKeys = 255,
+    TableKeyMapping = true,
+    MappedKeyMinUses = 2,
+    MaxMappedKeys = 255,
+    TableStrategy = "Auto",
 
-	TableStrategy = "Auto",
+    CompressBuffers = true,
+    BufferStrategy = "Auto",
+    BufferMinLength = 6,
+    BufferSearchDepth = 32,
+    BufferWindowSize = 32767,
+    BufferMaxMatch = 66,
 
-	CompressBuffers = true,
-	BufferStrategy = "Auto",
-	BufferMinLength = 6,
-	BufferSearchDepth = 32,
-	BufferWindowSize = 32767,
-	BufferMaxMatch = 66,
+    EntropyCoding = true,
+    EntropyStrategy = "Auto",
+    HuffmanMinBytes = 16,
+    HuffmanMinSavings = 1,
+    HuffmanMaxCodeBits = 32,
 
-	VerifyHash = true,
-	SchemaVersion = 1,
-
-	AllowExpansion = false,
+    VerifyHash = true,
+    SchemaVersion = 1,
+    AllowExpansion = false,
 }
 ```
 
-Not every option needs to be specified.
-
-The normal high-level call can simply use defaults:
+Not every option needs to be specified. The normal high-level call uses safe defaults:
 
 ```lua
-local packet =
-	Compression.Pack(value)
+local packet = Compression.Pack(value)
 ```
 
----
+## EntropyStrategy
+
+```text
+Auto
+Huffman
+None
+```
+
+- `Auto` tries canonical Huffman when the candidate meets the minimum-size threshold and the complete Huffman frame saves enough bytes.
+- `Huffman` explicitly requests Huffman, while still respecting `AllowExpansion`.
+- `None` disables the entropy layer.
+- `EntropyCoding = false` is also treated as `None`.
 
 ## StringStrategy
 
@@ -2654,8 +2386,6 @@ Identifier6
 Numeric4
 ```
 
----
-
 ## BufferStrategy
 
 ```text
@@ -2666,8 +2396,6 @@ Sparse
 Nibble
 ```
 
----
-
 ## TableStrategy
 
 ```text
@@ -2675,8 +2403,6 @@ Auto
 Compact
 Dynamic
 ```
-
----
 
 ## Mode
 
@@ -2689,7 +2415,17 @@ BinaryWithHash
 
 # Public API Overview
 
-v2.3.2 exposes 80 public functions.
+v2.5.5 exposes **85 public functions**.
+
+## Huffman / Entropy
+
+```text
+IsHuffman
+HuffmanEncode
+HuffmanDecode
+TryHuffman
+HuffmanStats
+```
 
 ## Strings
 
@@ -2732,7 +2468,6 @@ CanAuto
 TryAutoDecompress
 AutoStats
 PrintAutoStats
-
 Pack
 Unpack
 TryPack
@@ -2766,12 +2501,11 @@ PrintTableStats
 EstimateRawBytes
 ```
 
-## Schemas
+## Schemas / Descriptors
 
 ```text
 Schema
 Optional
-
 Bool
 UInt
 Int
@@ -2779,7 +2513,6 @@ Float
 String
 CompressedString
 Buffer
-
 Vector2
 Vector3
 Color3
@@ -2790,12 +2523,10 @@ Rect
 NumberRange
 BrickColor
 DateTime
-
 Array
 Object
 Quantized
 QuantizedVector3
-
 InferDescriptor
 AutoDescriptor
 ```
@@ -2811,11 +2542,9 @@ Analyze
 Version
 ```
 
----
-
 ## AllowExpansion
 
-`AllowExpansion` controls whether an explicitly requested compression strategy is allowed to return a payload larger than the raw representation.
+`AllowExpansion` controls whether an explicitly requested compression strategy is allowed to return a payload larger than its raw representation.
 
 Default:
 
@@ -2823,253 +2552,175 @@ Default:
 AllowExpansion = false
 ```
 
-In v2.3.2, forced string strategies such as `Numeric4`, `Identifier6`, `ASCII7`, and `LZ`, plus forced buffer `LZ`, respect this setting consistently.
+In v2.5.5 this applies consistently to forced string codecs, forced buffer LZ, and forced Huffman behavior.
 
-With the default behavior:
-
-```lua
-local compressed =
-	Compression.CompressString(
-		"abc",
-		{
-			StringStrategy = "LZ",
-			AllowExpansion = false,
-		}
-	)
-```
-
-the compressor can fall back to raw when the requested codec would make the payload larger.
-
-To explicitly allow the requested codec even when it expands the payload:
-
-```lua
-local compressed =
-	Compression.CompressString(
-		"abc",
-		{
-			StringStrategy = "LZ",
-			AllowExpansion = true,
-		}
-	)
-```
-
-`Auto` still prefers the smallest safe representation.
-
-# Backward Compatibility
-
-v2.3.2 uses:
-
-```text
-Binary format: 22
-```
-
-v2.3.2 intentionally keeps the same binary format as v2.3.1 and v2.3.0.
-
-The decoder retains support for compatible earlier formats handled by the v2.x decoder. v2.3.2 also includes recovery for the affected short `SparsePower2` representation produced by compatible v2.3.1 data.
-
-Because the wire format remains `22`, the v2.3.2 bug-fix release does not require a new storage-format revision.
-
-As with any serialization system, test persisted production data before deploying a codec or schema change.
+With the default setting, explicit codecs may safely fall back to raw when their frame is larger. Set `AllowExpansion = true` when you intentionally want to benchmark the requested codec even when it expands.
 
 ---
 
-# v2.3.2 Patch Notes
+# Backward Compatibility
 
-v2.3.2 is a compatibility-focused bug-fix and compression-handling release built on the v2.3.1 API.
-
-It keeps:
+v2.5.5 writes:
 
 ```text
-Public API: 80 functions
-Binary format: 22
+Binary format: 24
 ```
 
-while improving strategy selection, buffer correctness, packet statistics, and malformed-payload handling.
+The v2.5.5 decoder still accepts compatible binary versions **23 through 6** on the generic binary path, and compatible compact-number versions handled by the v2.x decoder.
 
-## Safer forced string strategies
+Important release progression:
 
-Explicit string strategies now respect `AllowExpansion` consistently.
+```text
+v2.3.x -> format 22
+v2.4.0 -> format 23
+v2.5.5 -> format 24
+```
 
-Covered strategies:
+Format 24 was introduced because schema bit/byte alignment was corrected. The decoder also keeps recovery support for the affected legacy v2.3.1 short `SparsePower2` representation.
+
+As with any serialization system, validate persisted production data and schema migrations before deploying a format-changing update.
+
+---
+
+# v2.5.5 Patch Notes
+
+v2.5.5 is a correctness, compatibility, and entropy-compression release built on the v2.4 Huffman architecture.
+
+```text
+Version:       2.5.5
+Binary format: 24
+Public API:    85 functions
+Regression:    122 passed / 0 failed / 0 skipped
+```
+
+## Canonical Huffman entropy layer
+
+The module now supports canonical Huffman coding directly and as an optional second-stage entropy codec.
+
+New public APIs:
+
+```text
+HuffmanEncode
+HuffmanDecode
+TryHuffman
+IsHuffman
+HuffmanStats
+```
+
+Auto Huffman measures the complete frame, including symbol/code-length metadata, and keeps the original representation when Huffman is not smaller.
+
+## Type-aware compression before Huffman
+
+Huffman does not replace existing codecs. It runs after specialized representations such as:
+
+```text
+VarUInt / ZigZag VarInt
+exact Float32 / Float64 selection
+Numeric4 / Identifier6 / ASCII7
+LZ
+SparseZero / SparsePower2
+Nibble4 / NibbleHigh4
+RLE arrays
+delta arrays
+compact tables
+dynamic dictionaries
+Roblox datatype arrays
+```
+
+This keeps the system optimized for Roblox-shaped data instead of treating every value as an undifferentiated byte blob.
+
+## Boolean Huffman bypass
+
+Standalone booleans remain on the one-useful-bit compact path and do not use Huffman per value.
+
+## Schema alignment regression fix
+
+v2.4 could leave a boolean/optional bit pending while the next byte-oriented schema descriptor started writing. That shifted following payload bytes and could produce `invalid number payload` during decode.
+
+v2.5.5 flushes/alignment-handles the transition correctly. Regression coverage includes `Bool -> Rect`, full schemas with and without Huffman, optional fields, and schema deltas.
+
+## Expansion-safety restoration
+
+The following forced codecs once again fall back safely when `AllowExpansion = false`:
 
 ```text
 Numeric4
 Identifier6
 ASCII7
-LZ
+String LZ
+Buffer LZ
+Huffman
 ```
 
-With:
+## SparsePower2 compatibility and validation
+
+v2.5.5 recovers compatible legacy v2.3.1 short `SparsePower2` data and rejects malformed bitmap padding.
+
+## Buffer entropy framing fix
+
+Top-level Auto buffers now preserve their buffer type when Huffman wins. This fixed randomized Auto-buffer failures that previously decoded as an invalid generic binary header.
+
+## Entropy packet metadata
+
+Adaptive packets can report:
+
+```text
+Entropy
+EntropyBytesBefore
+EntropyBytesAfter
+EntropySavedBytes
+```
+
+This makes it possible to distinguish savings produced by the first-stage codec from savings produced by Huffman.
+
+## Measured v2.5.5 results
+
+Selected examples from the full suite:
+
+```text
+String LZ:          1280 B ->   51 B
+Repetitive string:  3712 B ->  107 B
+Buffer LZ:          4096 B ->  142 B
+Skew buffer:        8192 B -> 1243 B
+UInt array:          518 B ->   93 B  vs Entropy=None representation
+Vector3 array:      3081 B ->  697 B  vs Entropy=None representation
+Color3 array:        777 B ->  144 B  vs Entropy=None representation
+Player-data table:  1311 B ->  759 B  vs Entropy=None representation
+Schema:             1939 B -> 1691 B  with Auto Huffman
+```
+
+## Performance trade-off
+
+Huffman improves many payload sizes, but it costs CPU. The v2.5.5 benchmark showed especially large overhead on table Huffman paths compared with `EntropyStrategy = "None"`.
+
+For latency-sensitive high-frequency network messages, benchmark both:
 
 ```lua
-AllowExpansion = false
+{ EntropyStrategy = "None" }
 ```
 
-a forced codec can fall back to raw if its encoded payload would be larger.
-
-With:
+and:
 
 ```lua
-AllowExpansion = true
+{ EntropyStrategy = "Auto" }
 ```
 
-the explicitly selected codec is allowed to expand the payload.
-
-This behavior is regression-tested for every listed string strategy.
-
----
-
-## Buffer LZ expansion handling
-
-Forced buffer `LZ` now follows the same expansion policy.
-
-```lua
-local compressed =
-	Compression.CompressBuffer(
-		value,
-		{
-			BufferStrategy = "LZ",
-			AllowExpansion = false,
-		}
-	)
-```
-
-If LZ is larger, the raw representation is preferred.
-
-Setting `AllowExpansion = true` allows the requested LZ frame even when it is larger.
-
----
-
-## SparsePower2 short-buffer fix
-
-v2.3.1 had an edge case where a short `SparsePower2` buffer could be emitted in a bitmap representation that the short-buffer decoder interpreted as the compact positional representation.
-
-v2.3.2 removes that ambiguous encoder path.
-
-The regression suite covers:
-
-```text
-short SparsePower2 <= 7 entries
-short SparsePower2 > 7 entries
-legacy v2.3.1 short SparsePower2 recovery
-```
-
-This keeps the optimized short representation for the safe case while avoiding the ambiguous form.
-
----
-
-## Legacy v2.3.1 SparsePower2 recovery
-
-Compatible affected v2.3.1 short `SparsePower2` payloads can be recovered by the v2.3.2 decoder when their representation can be identified safely.
-
-This is a decoder compatibility improvement and does not change binary format `22`.
-
----
-
-## SparsePower2 validation
-
-Malformed `SparsePower2` bitmap padding is rejected instead of being silently accepted.
-
-The v2.3.2 regression test intentionally feeds an invalid payload and confirms decompression fails with a sparse-power2 padding error.
-
----
-
-## More accurate packet statistics
-
-v2.3.2 separates physical byte savings from useful-bit savings more clearly.
-
-Packet metadata now includes or consistently reports:
-
-```text
-RawBytes
-RawBits
-
-SavedBytes
-ExpandedBytes
-ByteDelta
-
-SavedBits
-ExpandedBits
-BitDelta
-
-UsefulBits
-PhysicalBits
-PaddingBits
-
-SavingsPercent
-ExpansionPercent
-BitSavingsPercent
-BitExpansionPercent
-```
-
-This is especially important for standalone booleans.
-
-Example:
-
-```text
-Raw:
-1 byte
-8 bits
-
-Compressed boolean:
-1 physical byte
-1 useful bit
-7 padding bits
-
-ByteDelta: 0
-BitDelta: 7
-```
-
-The boolean therefore saves `87.50%` of useful bits without falsely claiming that a byte-addressed Roblox `buffer` physically occupies one eighth of a byte.
-
----
-
-## Passthrough accounting
-
-Raw/passthrough packets use the actual raw representation as their comparison baseline.
-
-This keeps `RawBytes`, ratios, expansion values, and savings values consistent when compression correctly chooses not to transform incompressible data.
-
----
-
-## BinaryWithHash regression coverage
-
-v2.3.2 verifies both sides of the integrity path:
-
-```text
-valid BinaryWithHash packet -> restores successfully
-corrupted BinaryWithHash packet -> rejected
-```
-
-Hash verification continues to detect accidental corruption rather than provide cryptographic authentication.
-
----
+Use the version that gives the right bandwidth/CPU trade-off for the specific packet shape.
 
 ## Regression validation
 
-The v2.3.2 Studio type/regression suite completed with:
+The full v2.5.5 Studio suite completed with:
 
 ```text
 Module Loaded: true
-Compression Version: 2.3.2
-Register Regression: PASSED
-Tests Passed: 75
+Compression Version: 2.5.5
+Tests Passed: 122
+Tests Failed: 0
+Tests Skipped: 0
 Status: ALL PASSED
 ```
 
-The suite covers primitives, strings, buffers, Roblox datatypes, arrays, maps, nested tables, Bnum-compatible buffers, packet statistics, expansion fallback, SparsePower2 compatibility, invalid payload rejection, and hash verification.
-
----
-
-## Format compatibility
-
-v2.3.2 remains:
-
-```text
-Format 22
-```
-
-so it remains directly compatible with the v2.3.x binary format while fixing codec-selection and decoder edge cases.
+Coverage includes primitives, all current string and buffer modes, direct Huffman, malformed Huffman rejection, Roblox datatypes, arrays, maps, schemas, optional fields, deltas, quantized descriptors, expansion fallbacks, legacy SparsePower2 data, hash corruption, randomized buffers, randomized arrays, randomized strings, randomized nested tables, and Bnum-compatible buffers.
 
 ---
 
@@ -3084,7 +2735,7 @@ print(
 Expected:
 
 ```text
-2.3.2
+2.5.5
 ```
 
 ---
@@ -3150,4 +2801,4 @@ local ok, packet, err =
 
 https://create.roblox.com/store/asset/71588759746122/Compression
 
-That covers the main v2.3.2 workflow.
+That covers the main Compression v2.5.5 workflow.
