@@ -1,6 +1,6 @@
 # Compression
 
-**Current version: v2.3.1**  
+**Current version: v2.3.2**  
 **Binary format: 22**  
 **Public API: 80 functions**
 
@@ -50,7 +50,7 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - [Statistics and Analysis](#statistics-and-analysis)
 - [Configuration](#configuration)
 - [Backward Compatibility](#backward-compatibility)
-- [v2.3.1 Patch Notes](#v231-patch-notes)
+- [v2.3.2 Patch Notes](#v232-patch-notes)
 - [Version](#version)
 
 ---
@@ -329,9 +329,11 @@ Compression.TryDecompressTable(...)
 
 # Real Compression Examples
 
-The following examples come from a v2.3.1 Studio type test.
+The following examples come from the v2.3.2 Studio type/regression test.
 
 Compression ratios are input-dependent. They are examples, not guaranteed ratios for every value.
+
+The v2.3.2 regression suite completed with **75 tests passed** and **Status: ALL PASSED**. The release primarily improves correctness, fallback behavior, metadata accuracy, and edge-case handling while preserving the strong compression ratios of v2.3.1.
 
 ## Primitive numbers
 
@@ -535,11 +537,15 @@ print(packet.Bytes)
 print(packet.Bits)
 
 print(packet.RawBytes)
+print(packet.RawBits)
+
 print(packet.SavedBytes)
 print(packet.ExpandedBytes)
+print(packet.ByteDelta)
 
 print(packet.SavedBits)
 print(packet.ExpandedBits)
+print(packet.BitDelta)
 
 print(packet.UsefulBits)
 print(packet.PhysicalBits)
@@ -551,6 +557,8 @@ print(packet.Codec)
 print(packet.Ratio)
 print(packet.SavingsPercent)
 print(packet.ExpansionPercent)
+print(packet.BitSavingsPercent)
+print(packet.BitExpansionPercent)
 
 print(packet.IsSmaller)
 print(packet.IsPhysicallySmaller)
@@ -558,6 +566,8 @@ print(packet.IsBitSmaller)
 ```
 
 Not every field is meaningful for every packet, so some metadata can be `nil`.
+
+v2.3.2 makes byte-level and bit-level accounting explicit. `ByteDelta` compares physical encoded bytes with the raw byte estimate, while `BitDelta` compares useful encoded bits with the raw bit estimate. This prevents bit-packing wins from being reported as physical byte savings when the final `buffer` still occupies the same number of bytes.
 
 ---
 
@@ -1214,7 +1224,7 @@ Compression.PrintBufferStats(
 
 # Roblox Datatypes
 
-Compression v2.3.1 supports these Roblox datatypes directly:
+Compression v2.3.2 supports these Roblox datatypes directly:
 
 ```text
 Vector2
@@ -1895,7 +1905,7 @@ Disable it:
 UseStringDictionary = false
 ```
 
-v2.3.1 also rejects malformed payloads containing duplicate dictionary entries.
+v2.3.2 rejects malformed payloads containing duplicate dictionary entries.
 
 ---
 
@@ -2110,7 +2120,7 @@ Schema packets carry the schema version and reject incompatible schema versions.
 
 # Descriptor API
 
-v2.3.1 includes the following descriptor constructors:
+v2.3.2 includes the following descriptor constructors:
 
 | Descriptor | Purpose |
 | --- | --- |
@@ -2187,7 +2197,7 @@ Schema:Encode({
 })
 ```
 
-Required fields cannot be silently removed by a delta packet in v2.3.1.
+Required fields cannot be silently removed by a delta packet in v2.3.2.
 
 ---
 
@@ -2249,7 +2259,7 @@ local restored =
 	)
 ```
 
-v2.3.1 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
+v2.3.2 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
 
 ---
 
@@ -2402,13 +2412,20 @@ print(stats.Bytes)
 
 print(stats.SavedBytes)
 print(stats.ExpandedBytes)
+print(stats.ByteDelta)
 
 print(stats.UsefulBits)
 print(stats.PhysicalBits)
 print(stats.PaddingBits)
 
+print(stats.SavedBits)
+print(stats.ExpandedBits)
+print(stats.BitDelta)
+
 print(stats.SavingsPercent)
 print(stats.ExpansionPercent)
+print(stats.BitSavingsPercent)
+print(stats.BitExpansionPercent)
 ```
 
 Formatted:
@@ -2671,7 +2688,7 @@ BinaryWithHash
 
 # Public API Overview
 
-v2.3.1 exposes 80 public functions.
+v2.3.2 exposes 80 public functions.
 
 ## Strings
 
@@ -2795,152 +2812,263 @@ Version
 
 ---
 
+## AllowExpansion
+
+`AllowExpansion` controls whether an explicitly requested compression strategy is allowed to return a payload larger than the raw representation.
+
+Default:
+
+```lua
+AllowExpansion = false
+```
+
+In v2.3.2, forced string strategies such as `Numeric4`, `Identifier6`, `ASCII7`, and `LZ`, plus forced buffer `LZ`, respect this setting consistently.
+
+With the default behavior:
+
+```lua
+local compressed =
+	Compression.CompressString(
+		"abc",
+		{
+			StringStrategy = "LZ",
+			AllowExpansion = false,
+		}
+	)
+```
+
+the compressor can fall back to raw when the requested codec would make the payload larger.
+
+To explicitly allow the requested codec even when it expands the payload:
+
+```lua
+local compressed =
+	Compression.CompressString(
+		"abc",
+		{
+			StringStrategy = "LZ",
+			AllowExpansion = true,
+		}
+	)
+```
+
+`Auto` still prefers the smallest safe representation.
+
 # Backward Compatibility
 
-v2.3.1 uses:
+v2.3.2 uses:
 
 ```text
 Binary format: 22
 ```
 
-v2.3.1 intentionally keeps the same binary format as v2.3.0.
+v2.3.2 intentionally keeps the same binary format as v2.3.1 and v2.3.0.
 
-The decoder also retains support for compatible earlier formats handled by the v2.x decoder.
+The decoder retains support for compatible earlier formats handled by the v2.x decoder. v2.3.2 also includes recovery for the affected short `SparsePower2` representation produced by compatible v2.3.1 data.
 
-This means the v2.3.1 patch did not require another storage-format revision.
+Because the wire format remains `22`, the v2.3.2 bug-fix release does not require a new storage-format revision.
 
-As with any serialization system, test persisted production data before deploying a major codec or schema change.
+As with any serialization system, test persisted production data before deploying a codec or schema change.
 
 ---
 
-# v2.3.1 Patch Notes
+# v2.3.2 Patch Notes
 
-v2.3.1 is a bug-fix release built on the v2.3.0 API.
+v2.3.2 is a compatibility-focused bug-fix and compression-handling release built on the v2.3.1 API.
 
-## Empty-string atom fix
+It keeps:
 
-This now works correctly even when expansion is allowed:
+```text
+Public API: 80 functions
+Binary format: 22
+```
+
+while improving strategy selection, buffer correctness, packet statistics, and malformed-payload handling.
+
+## Safer forced string strategies
+
+Explicit string strategies now respect `AllowExpansion` consistently.
+
+Covered strategies:
+
+```text
+Numeric4
+Identifier6
+ASCII7
+LZ
+```
+
+With:
 
 ```lua
-local packet =
-	Compression.Pack(
-		"",
+AllowExpansion = false
+```
+
+a forced codec can fall back to raw if its encoded payload would be larger.
+
+With:
+
+```lua
+AllowExpansion = true
+```
+
+the explicitly selected codec is allowed to expand the payload.
+
+This behavior is regression-tested for every listed string strategy.
+
+---
+
+## Buffer LZ expansion handling
+
+Forced buffer `LZ` now follows the same expansion policy.
+
+```lua
+local compressed =
+	Compression.CompressBuffer(
+		value,
 		{
-			AllowExpansion = true,
+			BufferStrategy = "LZ",
+			AllowExpansion = false,
 		}
 	)
-
-local restored =
-	Compression.Unpack(
-		packet
-	)
 ```
 
-Result:
+If LZ is larger, the raw representation is preferred.
 
-```lua
-restored == ""
-```
+Setting `AllowExpansion = true` allows the requested LZ frame even when it is larger.
 
 ---
 
-## Required schema delta fields
+## SparsePower2 short-buffer fix
 
-Required fields can no longer be removed through `EncodeDelta()`.
+v2.3.1 had an edge case where a short `SparsePower2` buffer could be emitted in a bitmap representation that the short-buffer decoder interpreted as the compact positional representation.
 
-For example:
+v2.3.2 removes that ambiguous encoder path.
 
-```lua
-local Schema =
-	Compression.Schema({
-		Coins =
-			Compression.UInt(),
+The regression suite covers:
 
-		Enabled =
-			Compression.Bool(),
-	}, 1)
+```text
+short SparsePower2 <= 7 entries
+short SparsePower2 > 7 entries
+legacy v2.3.1 short SparsePower2 recovery
 ```
 
-This is invalid:
+This keeps the optimized short representation for the safe case while avoiding the ambiguous form.
 
-```lua
-previous = {
-	Coins = 100,
-	Enabled = true,
-}
+---
 
-current = {
-	Enabled = true,
-}
+## Legacy v2.3.1 SparsePower2 recovery
+
+Compatible affected v2.3.1 short `SparsePower2` payloads can be recovered by the v2.3.2 decoder when their representation can be identified safely.
+
+This is a decoder compatibility improvement and does not change binary format `22`.
+
+---
+
+## SparsePower2 validation
+
+Malformed `SparsePower2` bitmap padding is rejected instead of being silently accepted.
+
+The v2.3.2 regression test intentionally feeds an invalid payload and confirms decompression fails with a sparse-power2 padding error.
+
+---
+
+## More accurate packet statistics
+
+v2.3.2 separates physical byte savings from useful-bit savings more clearly.
+
+Packet metadata now includes or consistently reports:
+
+```text
+RawBytes
+RawBits
+
+SavedBytes
+ExpandedBytes
+ByteDelta
+
+SavedBits
+ExpandedBits
+BitDelta
+
+UsefulBits
+PhysicalBits
+PaddingBits
+
+SavingsPercent
+ExpansionPercent
+BitSavingsPercent
+BitExpansionPercent
 ```
 
-because `Coins` is required.
+This is especially important for standalone booleans.
 
-Use:
+Example:
 
-```lua
-Compression.Optional(...)
+```text
+Raw:
+1 byte
+8 bits
+
+Compressed boolean:
+1 physical byte
+1 useful bit
+7 padding bits
+
+ByteDelta: 0
+BitDelta: 7
 ```
 
-if a field is allowed to disappear.
+The boolean therefore saves `87.50%` of useful bits without falsely claiming that a byte-addressed Roblox `buffer` physically occupies one eighth of a byte.
 
 ---
 
-## Delta validation
+## Passthrough accounting
 
-v2.3.1 validates the complete resulting schema state, including unchanged values.
+Raw/passthrough packets use the actual raw representation as their comparison baseline.
 
-Invalid values cannot bypass descriptor checks simply because they did not change.
+This keeps `RawBytes`, ratios, expansion values, and savings values consistent when compression correctly chooses not to transform incompressible data.
 
 ---
 
-## Schema input errors
+## BinaryWithHash regression coverage
 
-Calls such as:
+v2.3.2 verifies both sides of the integrity path:
 
-```lua
-Schema:Encode(123)
+```text
+valid BinaryWithHash packet -> restores successfully
+corrupted BinaryWithHash packet -> rejected
 ```
 
-now fail with a clear schema-specific error.
-
-The same applies to invalid `AnalyzeBits()` and delta inputs.
+Hash verification continues to detect accidental corruption rather than provide cryptographic authentication.
 
 ---
 
-## Descriptor inference fixes
+## Regression validation
 
-Arrays of structured objects now require compatible recursive descriptor shapes.
+The v2.3.2 Studio type/regression suite completed with:
 
-This avoids generating an `Array<Object>` descriptor from objects that contain completely different fields.
+```text
+Module Loaded: true
+Compression Version: 2.3.2
+Register Regression: PASSED
+Tests Passed: 75
+Status: ALL PASSED
+```
 
----
-
-## Decoder allocation guards
-
-Container counts are checked before large allocations.
-
-The decoder uses a hard container-item ceiling in addition to payload-bound validation.
-
-This helps reject malformed or corrupted payloads before attempting huge `table.create()` calls.
-
----
-
-## Dynamic dictionary validation
-
-Duplicate dynamic string-dictionary entries are rejected during decode.
+The suite covers primitives, strings, buffers, Roblox datatypes, arrays, maps, nested tables, Bnum-compatible buffers, packet statistics, expansion fallback, SparsePower2 compatibility, invalid payload rejection, and hash verification.
 
 ---
 
 ## Format compatibility
 
-v2.3.1 remains:
+v2.3.2 remains:
 
 ```text
 Format 22
 ```
 
-so it stays directly compatible with the v2.3.0 format.
+so it remains directly compatible with the v2.3.x binary format while fixing codec-selection and decoder edge cases.
 
 ---
 
@@ -2955,7 +3083,7 @@ print(
 Expected:
 
 ```text
-2.3.1
+2.3.2
 ```
 
 ---
@@ -3017,4 +3145,4 @@ local ok, packet, err =
 	Compression.TryPack(value)
 ```
 
-That covers the main v2.3.1 workflow.
+That covers the main v2.3.2 workflow.
