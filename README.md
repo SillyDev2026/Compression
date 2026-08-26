@@ -1,23 +1,74 @@
 # Compression
 
-**Current version: v2.2.1**
+**Current version: v2.3.1**  
+**Binary format: 22**  
+**Public API: 80 functions**
 
-Compression is a binary serialization and compression library for Roblox/Luau focused on compact payloads, predictable round trips, and low overhead.
+Compression is a binary serialization and compression library for Roblox/Luau focused on compact payloads, predictable round trips, low overhead, and practical game-data serialization.
 
-It supports primitive values, Roblox datatypes, buffers, arrays, maps, schemas, delta packets, string dictionaries, integrity hashes, and adaptive codec selection through a single API.
+It supports primitive values, Roblox datatypes, strings, buffers, arrays, maps, nested tables, schemas, delta packets, repeated-string dictionaries, table-key mapping, integrity hashes, bit-layout analysis, and adaptive codec selection.
 
-The library is designed around one rule:
+The main rule of the library is:
 
-> Use a smaller representation when it is available. If compression would make the payload larger, preserve the original representation instead.
+> Use the smallest safe representation available. If compression would make the value larger, preserve a raw or passthrough representation when possible.
+
+For new code, the simplest API is:
+
+```lua
+local packet = Compression.Pack(value)
+local restored = Compression.Unpack(packet)
+```
+
+The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supported and maps to the same adaptive compression path.
 
 ---
 
-## Features
+## Contents
 
-- Adaptive `Compression.Auto(value)` codec selection
-- Compact booleans, integers, decimals, and powers of ten
-- Bit-packed boolean arrays
-- Compact `Vector2`, `Vector3`, `Color3`, and `CFrame`
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Pack and Unpack](#pack-and-unpack)
+- [Safe Calls](#safe-calls)
+- [Real Compression Examples](#real-compression-examples)
+- [Packet Metadata](#packet-metadata)
+- [Supported Types](#supported-types)
+- [Boolean Compression](#boolean-compression)
+- [Number Compression](#number-compression)
+- [String Compression](#string-compression)
+- [Buffer Compression](#buffer-compression)
+- [Roblox Datatypes](#roblox-datatypes)
+- [Table Compression](#table-compression)
+- [Table Key Mapping](#table-key-mapping)
+- [Compact Arrays](#compact-arrays)
+- [Dynamic Typed Arrays](#dynamic-typed-arrays)
+- [Schemas](#schemas)
+- [Descriptor API](#descriptor-api)
+- [Schema Delta Encoding](#schema-delta-encoding)
+- [Descriptor Inference](#descriptor-inference)
+- [Integrity Hashes](#integrity-hashes)
+- [Statistics and Analysis](#statistics-and-analysis)
+- [Configuration](#configuration)
+- [Backward Compatibility](#backward-compatibility)
+- [v2.3.1 Patch Notes](#v231-patch-notes)
+- [Version](#version)
+
+---
+
+# Features
+
+- Adaptive `Compression.Pack(value)` / `Compression.Unpack(packet)` API
+- Compatible `Compression.Auto()` / `Compression.AutoDecompress()` API
+- Safe `TryPack`, `TryUnpack`, and other `Try*` calls
+- `Compression.Size(value)` convenience call
+- `Compression.Codec(value)` convenience call
+- Compact boolean payloads
+- Compact zero, one, and negative-one number atoms
+- Compact unsigned and signed integers
+- Power-of-ten number encoding
+- Exact compact decimal representation
+- Exact Float32 selection when safe
+- Raw fallback when smaller compression is unavailable
 - String codecs:
   - Raw
   - Numeric4
@@ -26,6 +77,7 @@ The library is designed around one rule:
   - LZ
 - Buffer codecs:
   - Raw passthrough
+  - Raw framed
   - Zero
   - Fill
   - SparseZero
@@ -33,27 +85,56 @@ The library is designed around one rule:
   - Nibble4
   - NibbleHigh4
   - LZ
-- Compact table and array codecs
+- Compact table encoding
+- Dynamic tagged table encoding
+- Adaptive Compact-vs-Dynamic table selection
+- Bit-packed boolean arrays
+- Compact UInt and Int arrays
+- Float32 and Float64 array paths
 - Delta-encoded numeric arrays
 - Run-length encoded arrays
-- Nested table support
-- Buffers and Roblox datatypes inside tables
+- Shared nested table-key mapping
 - Dynamic repeated-string dictionaries
+- Inline small-number tags in Dynamic tables
+- Native Roblox datatype support
+- Homogeneous Roblox datatype arrays
 - Schema-based serialization
 - Schema version validation
 - Schema delta packets
+- Optional fields
+- Quantized number and Vector3 descriptors
+- Automatic descriptor inference
 - Optional FNV-1a integrity hashes
+- Useful-bit vs physical-bit statistics
 - Bit-layout analysis
-- Backward decoding support for compatible older packet versions
-- Reduced Luau top-level register usage for large-module stability
+- Malformed payload and allocation guards
+- Backward decoding support for compatible older formats
+- Reduced top-level Luau register pressure
 
 ---
 
-## Installation
+# Installation
 
-Place the `Compression` ModuleScript somewhere accessible to both the server and client.
+Place the `Compression` ModuleScript somewhere accessible to the code that needs it.
 
-Example structure:
+Example:
+
+```text
+ReplicatedStorage
+└── Compression
+```
+
+Require it:
+
+```lua
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Compression = require(
+	ReplicatedStorage:WaitForChild("Compression")
+)
+```
+
+If you keep it under another folder, such as `NetStream`:
 
 ```text
 ReplicatedStorage
@@ -61,91 +142,394 @@ ReplicatedStorage
     └── Compression
 ```
 
-Require it with:
+then:
 
 ```lua
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Compression = require(
-	ReplicatedStorage.NetStream.Compression
+	ReplicatedStorage
+		:WaitForChild("NetStream")
+		:WaitForChild("Compression")
 )
 ```
 
 ---
 
-## Quick Start
+# Quick Start
 
 ```lua
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Compression = require(
-	ReplicatedStorage.NetStream.Compression
+	ReplicatedStorage:WaitForChild("Compression")
 )
 
-local packet = Compression.Auto({
+local data = {
 	Coins = 1_000_000,
 	Rebirths = 25,
 	Enabled = true,
-})
+}
+
+local packet = Compression.Pack(data)
 
 print("Codec:", packet.Codec)
 print("Bytes:", packet.Bytes)
 print("Bits:", packet.Bits)
 
-local restored = Compression.AutoDecompress(packet)
+local restored = Compression.Unpack(packet)
 
 print(restored.Coins)
 print(restored.Rebirths)
 print(restored.Enabled)
 ```
 
+For most code, this is all you need:
+
+```lua
+local packet = Compression.Pack(value)
+local value = Compression.Unpack(packet)
+```
+
 ---
 
-# Automatic Compression
+# Pack and Unpack
 
-`Compression.Auto()` inspects the input value and selects an appropriate codec.
+`Pack()` is the recommended high-level call in v2.3.x.
+
+```lua
+local packet = Compression.Pack(value)
+```
+
+It automatically inspects the value and chooses an appropriate lossless representation.
+
+Restore it with:
+
+```lua
+local restored = Compression.Unpack(packet)
+```
+
+These are convenience wrappers around the adaptive API:
+
+```text
+Pack       -> Auto
+Unpack     -> AutoDecompress
+TryPack    -> TryAuto
+TryUnpack  -> TryAutoDecompress
+```
+
+The original API remains valid:
 
 ```lua
 local packet = Compression.Auto(value)
 local restored = Compression.AutoDecompress(packet)
 ```
 
-Supported value categories include:
+---
+
+## Size
+
+Get the selected encoded size without manually reading packet fields:
 
 ```lua
-Compression.Auto(true)
-Compression.Auto(123)
-Compression.Auto(-25)
-Compression.Auto(123.456789)
-Compression.Auto("Hello World")
-Compression.Auto(buffer.create(64))
-Compression.Auto(Vector2.new(1, 2))
-Compression.Auto(Vector3.new(1, 2, 3))
-Compression.Auto(Color3.fromRGB(255, 100, 50))
-Compression.Auto(CFrame.new(1, 2, 3))
+local bytes, bits =
+	Compression.Size(value)
 
-Compression.Auto({
-	Coins = 1000,
-	Enabled = true,
-})
+print("Bytes:", bytes)
+print("Bits:", bits)
 ```
 
-The selected codec is exposed through:
+---
+
+## Codec
+
+Inspect the adaptive codec:
 
 ```lua
+local codec =
+	Compression.Codec(value)
+
+print(codec)
+```
+
+Examples may include:
+
+```text
+CompactBoolean1Bit
+CompactNumber
+CompactDecimal
+CompactFloat32
+CompactString
+Buffer/SparsePower2
+Table/CompactStringMap
+CompactVector3
+CompactColor3
+CompactCFrame
+CompactUDim
+CompactUDim2
+CompactRect
+CompactNumberRange
+CompactBrickColor
+CompactDateTime
+```
+
+The exact codec depends on the value.
+
+---
+
+# Safe Calls
+
+Use `TryPack()` if compression failure should be handled without throwing:
+
+```lua
+local ok, packet, err =
+	Compression.TryPack(value)
+
+if not ok then
+	warn("Compression failed:", err)
+	return
+end
+```
+
+Restore safely:
+
+```lua
+local ok, restored, err =
+	Compression.TryUnpack(packet)
+
+if not ok then
+	warn("Decompression failed:", err)
+	return
+end
+```
+
+The v2.3.x `Try*` APIs return useful error text:
+
+```text
+success, value, nil
+```
+
+or:
+
+```text
+false, nil, errorMessage
+```
+
+Additional safe helpers include:
+
+```lua
+Compression.TryAuto(...)
+Compression.TryAutoDecompress(...)
+Compression.TryDecompressString(...)
+Compression.TryDecompressBuffer(...)
+Compression.TryDecompressTable(...)
+```
+
+---
+
+# Real Compression Examples
+
+The following examples come from a v2.3.1 Studio type test.
+
+Compression ratios are input-dependent. They are examples, not guaranteed ratios for every value.
+
+## Primitive numbers
+
+| Value | Raw | Compressed | Saved | Savings |
+| --- | ---: | ---: | ---: | ---: |
+| `0` | 8 B | **1 B** | 7 B | **87.50%** |
+| `1` | 8 B | **1 B** | 7 B | **87.50%** |
+| `-1` | 8 B | **1 B** | 7 B | **87.50%** |
+| `100` | 8 B | **2 B** | 6 B | **75.00%** |
+| `1_000_000` | 8 B | **2 B** | 6 B | **75.00%** |
+| `-123456` | 8 B | **4 B** | 4 B | **50.00%** |
+| `123.456789` | 8 B | **6 B** | 2 B | **25.00%** |
+| `1e100` | 8 B | **3 B** | 5 B | **62.50%** |
+| `0.000001` | 8 B | **2 B** | 6 B | **75.00%** |
+
+For example:
+
+```lua
+local packet =
+	Compression.Pack(0)
+
 print(packet.Codec)
-print(packet.ValueType)
+print(packet.Bytes)
+print(packet.Bits)
+```
+
+Example result:
+
+```text
+Codec: CompactNumber
+
+RAW
+Bytes: 8 B
+Bits: 64 b
+
+COMPRESSED
+Bytes: 1 B
+Bits: 8 b
+
+Saved: 7 B
+Savings: 87.50%
+
+Returned Value: 0
+Exact Match: true
+```
+
+---
+
+## Strings
+
+| Example | Mode | Raw | Compressed | Savings |
+| --- | --- | ---: | ---: | ---: |
+| 30-digit numeric string | `Numeric4` | 30 B | **17 B** | **43.33%** |
+| Identifier-style string | `Identifier6` | 38 B | **31 B** | **18.42%** |
+| ASCII sentence | `ASCII7` | 47 B | **44 B** | **6.38%** |
+| Repetitive 400 B string | `LZ-v2` | 400 B | **26 B** | **93.50%** |
+| Auto repetitive 900 B string | `LZ-v2` | 900 B | **47 B** | **94.78%** |
+
+Example:
+
+```lua
+local value =
+	string.rep(
+		"HelloWorld",
+		40
+	)
+
+local compressed =
+	Compression.CompressString(value)
+
+print(
+	Compression.StringMode(
+		compressed
+	)
+)
+```
+
+A repetitive test string compressed from:
+
+```text
+400 B -> 26 B
+```
+
+using `LZ-v2`.
+
+---
+
+## Buffers
+
+| Buffer | Selected mode | Raw | Compressed | Savings |
+| --- | --- | ---: | ---: | ---: |
+| 100 zero bytes | `Zero` | 100 B | **3 B** | **97.00%** |
+| 100 copies of one byte | `Fill` | 100 B | **4 B** | **96.00%** |
+| Sparse zero buffer | `SparseZero` | 64 B | **15 B** | **76.56%** |
+| Sparse power-of-two buffer | `SparsePower2` | 64 B | **14 B** | **78.12%** |
+| Repetitive binary pattern | `LZ` | 512 B | **53 B** | **89.65%** |
+| Random/high-entropy buffer | `RawPassthrough` | 256 B | **256 B** | 0% |
+
+The final row is intentional.
+
+Compression does not force a larger representation when the bytes are already effectively incompressible.
+
+---
+
+## Roblox datatypes
+
+| Type | Raw estimate | Compressed | Savings |
+| --- | ---: | ---: | ---: |
+| `Vector2` | 16 B | **9 B** | **43.75%** |
+| `Vector3` | 24 B | **9 B** | **62.50%** |
+| `Color3` | 12 B | **4 B** | **66.67%** |
+| position-only `CFrame` | 96 B | **18 B** | **81.25%** |
+| rotated `CFrame` | 96 B | **48 B** | **50.00%** |
+
+A simple Auto `Vector3.new(1, 2, 3)` test reached:
+
+```text
+24 B -> 6 B
+75.00% saved
+```
+
+A simple Auto `CFrame.new(1, 2, 3)` test reached:
+
+```text
+96 B -> 15 B
+84.38% saved
+```
+
+Different component values can choose different internal number representations, so sizes vary.
+
+---
+
+## Arrays
+
+| Array type | Mode | Raw estimate | Compressed | Savings |
+| --- | --- | ---: | ---: | ---: |
+| booleans | `CompactBoolArray` | 54 B | **3 B** | **94.44%** |
+| UInt array | `CompactUIntArray` | 160 B | **12 B** | **92.50%** |
+| Int array | `CompactIntArray` | 176 B | **14 B** | **92.05%** |
+| exact Float32 array | `CompactFloat32Array` | 64 B | **19 B** | **70.31%** |
+| repeated string array | `CompactRLEArray` | 72 B | **15 B** | **79.17%** |
+| repeated numeric array | `CompactRLEArray` | 160 B | **14 B** | **91.25%** |
+| sequential UInt array | `CompactUIntDeltaArray` | 112 B | **11 B** | **90.18%** |
+
+---
+
+## Tables
+
+| Table | Mode | Raw estimate | Compressed | Savings |
+| --- | --- | ---: | ---: | ---: |
+| `{man = 1, exp = 3}` | `CompactStringMap` | 22 B | **12 B** | **45.45%** |
+| player data map | `CompactStringMap` | 60 B | **42 B** | **30.00%** |
+| mixed table | `CompactStringMap` | 166 B | **68 B** | **59.04%** |
+| nested player data | `CompactStringMap` | 139 B | **95 B** | **31.65%** |
+| table containing buffer | `CompactStringMap` | 91 B | **38 B** | **58.24%** |
+| table containing Roblox types | `CompactStringMap` | 179 B | **105 B** | **41.34%** |
+
+Example:
+
+```lua
+local data = {
+	Coins = 1000,
+	Rebirths = 10,
+	Enabled = true,
+}
+
+local packet =
+	Compression.Pack(data)
+
+print(packet.Codec)
+print(packet.Bytes)
+```
+
+One measured Auto test produced:
+
+```text
+Codec: Table/CompactStringMap
+
+Raw:        37 B
+Compressed: 25 B
+Saved:      12 B
+Savings:    32.43%
 ```
 
 ---
 
 # Packet Metadata
 
-Packets returned by APIs such as `Compression.Auto()` include compression metadata.
+Adaptive calls return a packet table.
 
 ```lua
-local packet = Compression.Auto(value)
+local packet =
+	Compression.Pack(value)
+```
 
+Common fields:
+
+```lua
 print(packet.Data)
 print(packet.Bytes)
 print(packet.Bits)
@@ -154,81 +538,248 @@ print(packet.RawBytes)
 print(packet.SavedBytes)
 print(packet.ExpandedBytes)
 
+print(packet.SavedBits)
+print(packet.ExpandedBits)
+
+print(packet.UsefulBits)
+print(packet.PhysicalBits)
+print(packet.PaddingBits)
+
 print(packet.ValueType)
 print(packet.Codec)
 
 print(packet.Ratio)
 print(packet.SavingsPercent)
+print(packet.ExpansionPercent)
+
+print(packet.IsSmaller)
+print(packet.IsPhysicallySmaller)
+print(packet.IsBitSmaller)
 ```
 
-Depending on the value, bit-level metadata may also be available.
+Not every field is meaningful for every packet, so some metadata can be `nil`.
 
 ---
 
-# Booleans
+## Useful Bits vs Physical Bits
 
-A boolean contains only two states and therefore requires one meaningful bit.
+Roblox `buffer` storage is byte-addressed.
 
-```lua
-local packet = Compression.Auto(true)
-
-print(packet.Bytes)
-print(packet.Bits)
-```
-
-A standalone Roblox `buffer` is still byte-addressed, so the physical buffer occupies at least one byte.
-
-Conceptually:
-
-```text
-Physical container: 1 byte
-Boolean payload:    1 bit
-```
-
-When several booleans are stored together, they can be packed into shared bytes.
+A standalone boolean therefore still physically occupies at least one byte even though only one bit is meaningful.
 
 For example:
 
 ```text
-8 booleans  = 8 payload bits
-16 booleans = 16 payload bits
+Raw boolean:
+8 physical bits
+
+Compressed boolean:
+1 useful bit
+8 physical bits
+7 unused physical bits
 ```
 
-Boolean arrays use this packed representation automatically.
+The v2.3.x metadata keeps these concepts separate:
+
+```lua
+packet.UsefulBits
+packet.PhysicalBits
+packet.PaddingBits
+```
+
+This is especially useful for bit-packed tables and schemas.
+
+---
+
+# Supported Types
+
+`Compression.Pack()` supports the following top-level value categories:
+
+```text
+nil
+boolean
+number
+string
+buffer
+table
+
+Vector2
+Vector3
+Color3
+CFrame
+
+UDim
+UDim2
+Rect
+NumberRange
+BrickColor
+DateTime
+```
+
+Example:
+
+```lua
+Compression.Pack(true)
+Compression.Pack(123)
+Compression.Pack("Hello")
+Compression.Pack(buffer.create(64))
+Compression.Pack(Vector3.new(1, 2, 3))
+Compression.Pack(UDim2.new(0.5, 0, 1, -50))
+Compression.Pack(DateTime.now())
+```
+
+---
+
+# Boolean Compression
+
+A boolean only contains two possible states.
+
+```lua
+local packet =
+	Compression.Pack(true)
+
+print(packet.Codec)
+print(packet.Bytes)
+print(packet.Bits)
+```
+
+Example:
+
+```text
+Codec: CompactBoolean1Bit
+Physical Bytes: 1 B
+Useful Bits: 1 b
+```
+
+This distinction becomes more valuable inside arrays because many booleans can share bytes.
 
 ---
 
 # Number Compression
 
-Compression includes specialized representations for common numeric patterns.
+Luau numbers normally use 64-bit floating point storage.
+
+Compression detects special numeric patterns and uses smaller exact encodings when possible.
 
 Examples:
 
 ```lua
-Compression.Auto(0)
-Compression.Auto(1)
-Compression.Auto(-1)
-Compression.Auto(100)
-Compression.Auto(1_000_000)
-Compression.Auto(-123456)
-Compression.Auto(123.456789)
-Compression.Auto(1e100)
-Compression.Auto(0.000001)
+Compression.Pack(0)
+Compression.Pack(1)
+Compression.Pack(-1)
+
+Compression.Pack(100)
+Compression.Pack(1_000_000)
+Compression.Pack(-123456)
+
+Compression.Pack(12.375)
+Compression.Pack(123.456789)
+
+Compression.Pack(1e100)
+Compression.Pack(0.000001)
 ```
 
-Possible optimizations include:
+Possible internal paths include:
 
-- Zero
-- One
-- Negative one
-- Compact unsigned integers
-- Compact signed integers
-- Powers of ten
-- Compact decimal values
-- Float32-compatible values
-- Raw passthrough when a smaller lossless representation is unavailable
+```text
+Zero
+One
+Negative One
+UInt
+Int
+Power10
+Float32
+Decimal
+Float64 fallback
+```
 
-Small and structured numbers can be significantly smaller than the normal 64-bit Lua number representation.
+---
+
+## Zero
+
+```lua
+local packet =
+	Compression.Pack(0)
+```
+
+Measured example:
+
+```text
+8 B -> 1 B
+87.50% saved
+```
+
+---
+
+## Compact integers
+
+Small and medium integers use variable-width representations.
+
+Example:
+
+```lua
+local packet =
+	Compression.Pack(100)
+```
+
+Measured example:
+
+```text
+8 B -> 2 B
+75.00% saved
+```
+
+---
+
+## Compact decimals
+
+Some decimal values can be represented exactly as an integer plus decimal scale.
+
+Example:
+
+```lua
+local packet =
+	Compression.Pack(
+		123.456789
+	)
+```
+
+Measured example:
+
+```text
+Codec: CompactDecimal
+8 B -> 6 B
+25.00% saved
+```
+
+---
+
+## Float32
+
+Float32 is used only when converting to Float32 and back produces exactly the same Luau number.
+
+The library does not silently reduce precision just to save bytes.
+
+---
+
+## Power-of-ten values
+
+Values such as:
+
+```lua
+1e12
+1e100
+0.000001
+```
+
+can use specialized compact representations.
+
+A measured `1e100` result:
+
+```text
+8 B -> 3 B
+62.50% saved
+```
 
 ---
 
@@ -237,11 +788,26 @@ Small and structured numbers can be significantly smaller than the normal 64-bit
 Use:
 
 ```lua
-local compressed = Compression.CompressString(value)
-local restored = Compression.DecompressString(compressed)
+local compressed =
+	Compression.CompressString(value)
+
+local restored =
+	Compression.DecompressString(
+		compressed
+	)
 ```
 
-Available strategies:
+Inspect the selected mode:
+
+```lua
+print(
+	Compression.StringMode(
+		compressed
+	)
+)
+```
+
+Current strategies:
 
 ```text
 Auto
@@ -252,16 +818,25 @@ ASCII7
 LZ
 ```
 
-Specify a strategy with:
+---
+
+## Raw
+
+Force raw string handling:
 
 ```lua
-local compressed = Compression.CompressString(
-	value,
-	{
-		StringStrategy = "Numeric4",
-	}
-)
+local compressed =
+	Compression.CompressString(
+		value,
+		{
+			StringStrategy = "Raw",
+		}
+	)
 ```
+
+Depending on the bytes, Raw may be a direct passthrough or framed raw representation.
+
+---
 
 ## Numeric4
 
@@ -279,17 +854,27 @@ E
 Example:
 
 ```lua
-local compressed = Compression.CompressString(
-	"123456789012345678901234567890",
-	{
-		StringStrategy = "Numeric4",
-	}
-)
+local compressed =
+	Compression.CompressString(
+		"123456789012345678901234567890",
+		{
+			StringStrategy = "Numeric4",
+		}
+	)
 ```
+
+Measured:
+
+```text
+30 B -> 17 B
+43.33% saved
+```
+
+---
 
 ## Identifier6
 
-Optimized for identifier-style strings containing:
+Optimized for identifier-like strings using:
 
 ```text
 A-Z
@@ -305,28 +890,81 @@ Example:
 PlayerData_Coins_Rebirths_Level_123456
 ```
 
+Measured:
+
+```text
+38 B -> 31 B
+18.42% saved
+```
+
+---
+
 ## ASCII7
 
-Stores ASCII-compatible text with 7-bit symbols.
+Stores compatible characters using 7-bit symbols.
+
+Measured example:
+
+```text
+47 B -> 44 B
+6.38% saved
+```
+
+---
 
 ## LZ
 
-Useful for repetitive strings.
+Useful for repeated text:
 
 ```lua
-local value = string.rep(
-	"PlayerDataCoinsPlayerDataCoins",
-	30
-)
+local value =
+	string.rep(
+		"PlayerDataCoins",
+		64
+	)
 
-local compressed = Compression.CompressString(value)
+local compressed =
+	Compression.CompressString(
+		value
+	)
 ```
 
-Inspect the selected string mode with:
+Measured examples:
+
+```text
+400 B -> 26 B
+93.50% saved
+```
+
+and:
+
+```text
+900 B -> 47 B
+94.78% saved
+```
+
+---
+
+## String statistics
 
 ```lua
-print(
-	Compression.StringMode(compressed)
+local stats =
+	Compression.StringStats(value)
+
+print(stats.Mode)
+print(stats.RawBytes)
+print(stats.Bytes)
+print(stats.SavedBytes)
+print(stats.ExpandedBytes)
+print(stats.SavingsPercent)
+print(stats.ExpansionPercent)
+```
+
+Formatted report:
+
+```lua
+Compression.PrintStringStats(
+	value
 )
 ```
 
@@ -334,61 +972,90 @@ print(
 
 # Buffer Compression
 
-Buffers can be compressed directly.
+Use:
 
 ```lua
-local compressed = Compression.CompressBuffer(value)
-local restored = Compression.DecompressBuffer(compressed)
+local compressed =
+	Compression.CompressBuffer(value)
+
+local restored =
+	Compression.DecompressBuffer(
+		compressed
+	)
 ```
 
-Inspect the selected codec:
-
-```lua
-print(
-	Compression.BufferMode(compressed)
-)
-```
-
-Inspect the frame version:
+Mode:
 
 ```lua
 print(
-	Compression.BufferFrameVersion(compressed)
+	Compression.BufferMode(
+		compressed
+	)
 )
 ```
 
-Current buffer modes include:
+Frame version:
+
+```lua
+print(
+	Compression.BufferFrameVersion(
+		compressed
+	)
+)
+```
+
+Current buffer strategies:
+
+```text
+Auto
+Raw
+LZ
+Sparse
+Nibble
+```
+
+Current output modes include:
 
 | Mode | Purpose |
 | --- | --- |
-| `RawPassthrough` | Leaves incompressible data unchanged |
-| `Zero` | Buffers containing only zero bytes |
-| `Fill` | Buffers containing one repeated byte |
-| `SparseZero` | Buffers containing mostly zeroes |
-| `SparsePower2` | Sparse buffers containing powers-of-two byte values |
-| `Nibble4` | Values that fit inside the low 4 bits |
-| `NibbleHigh4` | Values that fit inside the high 4 bits |
-| `LZ` | Repeated binary patterns |
+| `RawPassthrough` | Keeps original bytes when compression is not smaller |
+| `Raw` | Framed raw representation |
+| `Zero` | All bytes are zero |
+| `Fill` | One repeated byte |
+| `SparseZero` | Mostly zero bytes |
+| `SparsePower2` | Sparse powers-of-two values |
+| `Nibble4` | Values fit in low four bits |
+| `NibbleHigh4` | Values fit in high four bits |
+| `LZ` | Repeated binary sequences |
 
 ---
 
-## Zero Buffers
+## Zero buffers
 
 ```lua
-local value = buffer.create(100)
+local value =
+	buffer.create(100)
 
 local compressed =
-	Compression.CompressBuffer(value)
+	Compression.CompressBuffer(
+		value
+	)
 ```
 
-Instead of storing every zero byte, Compression stores the buffer length and the selected Zero mode.
+Measured:
+
+```text
+100 B -> 3 B
+97.00% saved
+```
 
 ---
 
-## Fill Buffers
+## Fill buffers
 
 ```lua
-local value = buffer.create(100)
+local value =
+	buffer.create(100)
 
 buffer.fill(
 	value,
@@ -397,34 +1064,44 @@ buffer.fill(
 )
 
 local compressed =
-	Compression.CompressBuffer(value)
+	Compression.CompressBuffer(
+		value
+	)
 ```
 
-The repeated byte only needs to be stored once.
+Measured:
+
+```text
+100 B -> 4 B
+96.00% saved
+```
 
 ---
 
 ## SparseZero
 
 ```lua
-local value = buffer.create(64)
+local value =
+	buffer.create(64)
 
 buffer.writeu8(value, 0, 25)
 buffer.writeu8(value, 20, 50)
 buffer.writeu8(value, 40, 75)
 buffer.writeu8(value, 63, 100)
-
-local compressed =
-	Compression.CompressBuffer(value)
 ```
 
-SparseZero stores a bitmap describing non-zero locations plus the non-zero byte values.
+Measured:
+
+```text
+64 B -> 15 B
+76.56% saved
+```
 
 ---
 
 ## SparsePower2
 
-SparsePower2 is optimized for sparse buffers whose non-zero bytes are:
+Optimized for sparse values such as:
 
 ```text
 1
@@ -437,21 +1114,30 @@ SparsePower2 is optimized for sparse buffers whose non-zero bytes are:
 128
 ```
 
-This works particularly well with some compact binary structures.
+Measured:
+
+```text
+64 B -> 14 B
+78.12% saved
+```
 
 ---
 
-## Nibble Compression
+## Nibble4
 
-Nibble codecs store two four-bit values in one byte.
-
-Low nibble values:
+Nibble4 targets byte values in:
 
 ```text
 0 - 15
 ```
 
-High nibble values:
+Two four-bit values can share one byte.
+
+---
+
+## NibbleHigh4
+
+Targets:
 
 ```text
 0
@@ -464,162 +1150,508 @@ High nibble values:
 
 ---
 
-## LZ Buffers
+## Auto can beat a forced mode
 
-Repeated binary patterns can use the LZ buffer codec.
+If a nibble-compatible buffer is also highly repetitive, Auto may choose LZ because the final LZ result is smaller.
 
-```lua
-local value = buffer.create(512)
+This is expected.
 
-for i = 0, 511 do
-	buffer.writeu8(
-		value,
-		i,
-		i % 32
-	)
-end
+The compressor is trying to minimize the final payload, not merely choose the first valid specialized codec.
 
-local compressed =
-	Compression.CompressBuffer(value)
+---
+
+## LZ buffers
+
+Repeated binary structures can compress heavily.
+
+Measured:
+
+```text
+512 B -> 53 B
+89.65% saved
 ```
 
 ---
 
-## Raw Passthrough
+## Random data
 
-Lossless compression cannot guarantee that every input becomes smaller.
+Random or encrypted-looking data may not compress.
 
-Random or high-entropy data may already be close to incompressible.
-
-When no compressed representation is smaller, Compression can preserve the original bytes:
+Measured example:
 
 ```text
 Raw:        256 B
-Stored:     256 B
+Compressed: 256 B
 Mode:       RawPassthrough
 ```
 
-This avoids adding unnecessary compression overhead.
+That is preferable to expanding the payload.
+
+---
+
+## Buffer statistics
+
+```lua
+local stats =
+	Compression.BufferStats(value)
+
+print(stats.Mode)
+print(stats.RawBytes)
+print(stats.Bytes)
+print(stats.SavedBytes)
+print(stats.ExpandedBytes)
+```
+
+Formatted output:
+
+```lua
+Compression.PrintBufferStats(
+	value
+)
+```
 
 ---
 
 # Roblox Datatypes
 
-Compression supports Roblox datatypes directly.
+Compression v2.3.1 supports these Roblox datatypes directly:
+
+```text
+Vector2
+Vector3
+Color3
+CFrame
+UDim
+UDim2
+Rect
+NumberRange
+BrickColor
+DateTime
+```
+
+---
 
 ## Vector2
 
 ```lua
-local packet = Compression.Auto(
-	Vector2.new(
-		123.456,
-		-987.654
+local packet =
+	Compression.Pack(
+		Vector2.new(
+			123.5,
+			-456.25
+		)
 	)
-)
 ```
 
-Float32-compatible values can use a compact representation when the original Roblox value is restored exactly.
+Exact Float32 values can use an F32 path.
+
+Measured test:
+
+```text
+16 B -> 9 B
+43.75% saved
+```
+
+---
 
 ## Vector3
 
 ```lua
-local packet = Compression.Auto(
-	Vector3.new(
-		100,
-		200,
-		300
+local packet =
+	Compression.Pack(
+		Vector3.new(
+			100,
+			200,
+			300
+		)
 	)
-)
 ```
 
-Integer-like components can use compact number encoding.
+Measured test:
+
+```text
+24 B -> 9 B
+62.50% saved
+```
+
+A smaller `Vector3.new(1, 2, 3)` Auto case measured:
+
+```text
+24 B -> 6 B
+75.00% saved
+```
+
+---
 
 ## Color3
 
 ```lua
-local packet = Compression.Auto(
-	Color3.fromRGB(
-		100,
-		150,
-		255
+local packet =
+	Compression.Pack(
+		Color3.fromRGB(
+			100,
+			150,
+			255
+		)
 	)
-)
 ```
 
-RGB values can use compact byte components.
+Possible exact representations include:
+
+```text
+RGB8
+Float32
+Float64
+```
+
+The encoder only uses a smaller representation when it restores the same value.
+
+Measured RGB8-compatible example:
+
+```text
+12 B -> 4 B
+66.67% saved
+```
+
+---
 
 ## CFrame
 
 ```lua
-local packet = Compression.Auto(
-	CFrame.new(
-		100,
-		200,
-		300
+local packet =
+	Compression.Pack(
+		CFrame.new(
+			100,
+			200,
+			300
+		)
 	)
-)
 ```
 
-Simple transforms can compress heavily.
+Measured position-only example:
 
-Rotated transforms can use Float32 component encoding when it is smaller.
+```text
+96 B -> 18 B
+81.25% saved
+```
+
+A small identity-rotation CFrame measured:
+
+```text
+96 B -> 15 B
+84.38% saved
+```
+
+Rotated example:
+
+```text
+96 B -> 48 B
+50.00% saved
+```
+
+---
+
+## UDim
 
 ```lua
-local packet = Compression.Auto(
-	CFrame.new(
-		10,
-		20,
-		30
-	) * CFrame.Angles(
-		math.rad(45),
-		math.rad(90),
-		math.rad(15)
+local packet =
+	Compression.Pack(
+		UDim.new(
+			0.5,
+			12
+		)
+	)
+```
+
+`UDim` is supported both by the generic tagged encoder and the Schema API.
+
+---
+
+## UDim2
+
+```lua
+local packet =
+	Compression.Pack(
+		UDim2.new(
+			0.5,
+			-100,
+			1,
+			-25
+		)
+	)
+```
+
+Useful for UI configuration or serialized layout state.
+
+---
+
+## Rect
+
+```lua
+local packet =
+	Compression.Pack(
+		Rect.new(
+			0,
+			0,
+			1920,
+			1080
+		)
+	)
+```
+
+---
+
+## NumberRange
+
+```lua
+local packet =
+	Compression.Pack(
+		NumberRange.new(
+			1.25,
+			100
+		)
+	)
+```
+
+---
+
+## BrickColor
+
+```lua
+local packet =
+	Compression.Pack(
+		BrickColor.new(21)
+	)
+```
+
+---
+
+## DateTime
+
+```lua
+local packet =
+	Compression.Pack(
+		DateTime.now()
+	)
+```
+
+DateTime is stored using an exact millisecond timestamp representation.
+
+---
+
+# Table Compression
+
+Basic use:
+
+```lua
+local data = {
+	Coins = 1000,
+	Rebirths = 10,
+	Enabled = true,
+}
+
+local packet =
+	Compression.CompressTablePacket(
+		data
+	)
+
+local restored =
+	Compression.DecompressTable(
+		packet
+	)
+```
+
+Raw buffer-only form:
+
+```lua
+local compressed =
+	Compression.CompressTable(data)
+
+local restored =
+	Compression.DecompressTable(
+		compressed
+	)
+```
+
+Inspect the representation:
+
+```lua
+print(
+	Compression.TableMode(
+		packet
+	)
+)
+
+print(
+	Compression.IsCompactTable(
+		packet
 	)
 )
 ```
 
 ---
 
-# Table Compression
+## Table strategies
 
-Use:
+Three strategies are available:
 
-```lua
-local compressed = Compression.CompressTable({
-	Coins = 1000,
-	Rebirths = 10,
-	Enabled = true,
-})
-
-local restored =
-	Compression.DecompressTable(compressed)
+```text
+Auto
+Compact
+Dynamic
 ```
 
-Inspect the selected table representation:
+### Auto
+
+Recommended default.
 
 ```lua
-print(
-	Compression.TableMode(compressed)
-)
+local packet =
+	Compression.CompressTablePacket(
+		data,
+		{
+			TableStrategy = "Auto",
+		}
+	)
+```
 
-print(
-	Compression.IsCompactTable(compressed)
-)
+Auto evaluates the available table representations and chooses the smaller valid result.
+
+---
+
+### Compact
+
+```lua
+local packet =
+	Compression.CompressTablePacket(
+		data,
+		{
+			TableStrategy = "Compact",
+		}
+	)
+```
+
+If a value cannot be represented by the Compact format, v2.3.x can fall back to Dynamic instead of breaking the entire table encode.
+
+---
+
+### Dynamic
+
+```lua
+local packet =
+	Compression.CompressTablePacket(
+		data,
+		{
+			TableStrategy = "Dynamic",
+		}
+	)
+```
+
+Dynamic tables use tagged values and support the broader datatype set.
+
+---
+
+# Table Key Mapping
+
+Repeated nested string keys can be stored once and referenced using compact IDs.
+
+Example:
+
+```lua
+local pets = {
+	{
+		Name = "Dog",
+		Level = 1,
+		Power = 2,
+		Equipped = true,
+	},
+
+	{
+		Name = "Cat",
+		Level = 5,
+		Power = 4,
+		Equipped = false,
+	},
+
+	{
+		Name = "Dragon",
+		Level = 25,
+		Power = 100,
+		Equipped = true,
+	},
+}
+```
+
+Without mapping, these keys are repeated:
+
+```text
+Name
+Level
+Power
+Equipped
+```
+
+for every record.
+
+Enable mapping:
+
+```lua
+local packet =
+	Compression.CompressTablePacket(
+		pets,
+		{
+			TableStrategy = "Compact",
+			TableKeyMapping = true,
+		}
+	)
+```
+
+Possible mapped modes:
+
+```text
+CompactMappedMixedArray
+CompactMappedStringMap
+CompactMappedMap
+```
+
+Mapping is only selected when the mapped representation is actually smaller than normal Compact.
+
+---
+
+## Mapping statistics
+
+```lua
+local stats =
+	Compression.TableStats(
+		pets,
+		{
+			TableKeyMapping = true,
+		}
+	)
+
+print(stats.Mapped)
+print(stats.MappedKeys)
+print(stats.AvailableMappedKeys)
+
+print(stats.UnmappedCompactBytes)
+print(stats.MappedCompactBytes)
+
+print(stats.MappingSavedBytes)
+print(stats.MappingSavingsPercent)
 ```
 
 ---
 
 # Compact Arrays
 
-Compression recognizes common array layouts automatically.
-
-Current compact array modes include:
+Current Compact table array modes include:
 
 ```text
 CompactBoolArray
 CompactUIntArray
 CompactIntArray
 CompactFloatArray
+CompactFloat32Array
 CompactStringArray
 CompactMixedArray
 CompactUIntDeltaArray
@@ -627,10 +1659,12 @@ CompactIntDeltaArray
 CompactRLEArray
 ```
 
-## Boolean Arrays
+---
+
+## Boolean arrays
 
 ```lua
-{
+local data = {
 	true,
 	false,
 	true,
@@ -640,12 +1674,22 @@ CompactRLEArray
 }
 ```
 
-Boolean values are bit-packed.
+Booleans are bit-packed.
 
-## UInt Arrays
+Measured:
+
+```text
+Raw estimate: 54 B
+Compressed:   3 B
+Savings:      94.44%
+```
+
+---
+
+## UInt arrays
 
 ```lua
-{
+local data = {
 	1,
 	2,
 	3,
@@ -655,12 +1699,21 @@ Boolean values are bit-packed.
 }
 ```
 
-Unsigned integers use compact variable-width encoding.
+Unsigned integers use variable-width encoding.
 
-## Signed Integer Arrays
+Measured example:
+
+```text
+160 B -> 12 B
+92.50% saved
+```
+
+---
+
+## Int arrays
 
 ```lua
-{
+local data = {
 	-5,
 	-4,
 	-3,
@@ -673,12 +1726,40 @@ Unsigned integers use compact variable-width encoding.
 }
 ```
 
-## Delta Arrays
+Measured:
 
-Sequential numbers can store the first value followed by small differences.
+```text
+176 B -> 14 B
+92.05% saved
+```
+
+---
+
+## Float32 arrays
+
+Values that all survive exact Float32 round trips can use:
+
+```text
+CompactFloat32Array
+```
+
+Measured:
+
+```text
+64 B -> 19 B
+70.31% saved
+```
+
+If one value requires full precision, the array uses a Float64-compatible path.
+
+---
+
+## Delta arrays
+
+Sequential values can store the first value followed by compact differences.
 
 ```lua
-{
+local data = {
 	1000,
 	1001,
 	1002,
@@ -688,236 +1769,479 @@ Sequential numbers can store the first value followed by small differences.
 }
 ```
 
-## Run-Length Arrays
+Possible mode:
 
-Repeated values can use run-length encoding.
+```text
+CompactUIntDeltaArray
+```
 
-```lua
-{
-	100,
-	100,
-	100,
-	100,
-	100,
-	200,
-	200,
-	200,
-	300,
-	300,
-}
+Measured:
+
+```text
+112 B -> 11 B
+90.18% saved
 ```
 
 ---
 
-# Maps and Nested Tables
+## Run-length arrays
 
-String-key tables can use compact map encoding.
-
-```lua
-local data = {
-	Coins = 1_000_000,
-	Rebirths = 25,
-	Level = 100,
-	Enabled = true,
-	Name = "Player",
-}
-
-local compressed =
-	Compression.CompressTable(data)
-```
-
-Nested structures are supported:
+Repeated values can use RLE:
 
 ```lua
 local data = {
-	Version = 2,
+	100,
+	100,
+	100,
+	100,
+	100,
 
-	Data = {
-		Coins = 1e12,
-		Rebirths = 100,
-		Prestiges = 5,
+	200,
+	200,
+	200,
 
-		Stats = {
-			Strength = 1000,
-			Speed = 500,
-			Luck = 25,
-		},
-	},
-
-	Settings = {
-		Music = true,
-		SFX = true,
-		Particles = false,
-	},
+	300,
+	300,
 }
 ```
+
+Possible mode:
+
+```text
+CompactRLEArray
+```
+
+Measured:
+
+```text
+160 B -> 14 B
+91.25% saved
+```
+
+---
+
+# Dynamic Typed Arrays
+
+Dynamic tables recognize homogeneous arrays for several Roblox datatypes.
+
+Current typed-array modes include:
+
+```text
+Vector2F32Array
+Vector2F64Array
+
+Vector3F32Array
+Vector3F64Array
+
+Color3RGB8Array
+Color3F32Array
+Color3F64Array
+
+UDimArray
+UDim2Array
+NumberRangeArray
+BrickColorArray
+RectArray
+DateTimeArray
+```
+
+Example:
+
+```lua
+local positions = {
+	Vector3.new(1, 2, 3),
+	Vector3.new(4, 5, 6),
+	Vector3.new(7, 8, 9),
+}
+
+local packet =
+	Compression.CompressTablePacket(
+		positions,
+		{
+			TableStrategy = "Dynamic",
+		}
+	)
+
+print(
+	Compression.TableMode(
+		packet
+	)
+)
+```
+
+A homogeneous Vector3 array can avoid repeating the Vector3 type tag for every element.
+
+---
+
+# Dynamic String Dictionary
+
+Dynamic payloads can detect repeated strings and store them once in a shared dictionary.
+
+```lua
+local packet =
+	Compression.Encode(
+		data,
+		{
+			UseStringDictionary = true,
+			DictionaryMinUses = 2,
+			MaxDictionaryEntries = 255,
+		}
+	)
+```
+
+Disable it:
+
+```lua
+UseStringDictionary = false
+```
+
+v2.3.1 also rejects malformed payloads containing duplicate dictionary entries.
+
+---
+
+# Inline Small Numbers
+
+Dynamic tables contain special inline tags for common small integers.
+
+This reduces overhead for values such as:
+
+```lua
+{
+	Level = 5,
+	Tier = 2,
+	Amount = 12,
+	Index = 3,
+}
+```
+
+Small unsigned integers and a range of small negatives can be represented directly in the tag byte instead of requiring an additional VarInt/VarUInt byte.
 
 ---
 
 # Buffers Inside Tables
 
-Buffers can be stored inside compressed tables.
+Buffers can be nested inside tables:
 
 ```lua
-local payload = buffer.create(64)
+local payload =
+	buffer.create(64)
 
-for i = 0, 15 do
+for index = 0, 15 do
 	buffer.writeu32(
 		payload,
-		i * 4,
+		index * 4,
 		1000
 	)
 end
 
-local compressed = Compression.CompressTable({
-	UserId = 123456789,
-	Buffer = payload,
-	Active = true,
-})
+local packet =
+	Compression.Pack({
+		UserId = 123456789,
+		Buffer = payload,
+		Active = true,
+	})
+```
+
+Measured table-with-buffer test:
+
+```text
+91 B -> 38 B
+58.24% saved
+```
+
+---
+
+# Roblox Types Inside Tables
+
+Roblox datatypes can be nested:
+
+```lua
+local data = {
+	Direction =
+		Vector2.new(
+			1,
+			-1
+		),
+
+	Position =
+		Vector3.new(
+			100,
+			200,
+			300
+		),
+
+	Color =
+		Color3.fromRGB(
+			50,
+			150,
+			250
+		),
+
+	Transform =
+		CFrame.new(
+			10,
+			20,
+			30
+		),
+}
+```
+
+Measured:
+
+```text
+179 B -> 105 B
+41.34% saved
+```
+
+Newer v2.3.x Dynamic tables also support:
+
+```text
+UDim
+UDim2
+Rect
+NumberRange
+BrickColor
+DateTime
 ```
 
 ---
 
 # Bnum Compatibility
 
-Bnum uses a compact 12-byte buffer representation, so it can use the normal buffer compression pipeline.
+If a big-number library exposes its value as a compact Roblox `buffer`, it can use the normal buffer compression pipeline.
+
+Example:
 
 ```lua
-local Bnum = require(
-	game.ReplicatedStorage.Bnum
-)
+local Bnum =
+	require(
+		game.ReplicatedStorage.Bnum
+	)
 
-local value = Bnum.new(1, 3)
+local value =
+	Bnum.new(
+		1,
+		3
+	)
 
 local compressed =
-	Compression.CompressBuffer(value)
+	Compression.CompressBuffer(
+		value
+	)
 
 local restored =
-	Compression.DecompressBuffer(compressed)
+	Compression.DecompressBuffer(
+		compressed
+	)
 ```
 
-Example result from v2.2.x testing:
+A previous measured example:
 
 ```text
-Bnum.new(1, 3)
-
 Raw:        12 B
 Compressed: 5 B
 Mode:       SparsePower2
 Savings:    58.33%
 ```
 
-Different Bnum values may select `SparseZero`, `SparsePower2`, or another buffer mode automatically.
+The selected buffer mode depends on the actual buffer contents.
 
 ---
 
 # Schemas
 
-Schemas are recommended when the structure of the payload is known ahead of time.
+Schemas are useful when the exact structure of the payload is known ahead of time.
+
+Example:
 
 ```lua
-local Schema = Compression.Schema({
-	Boolean = Compression.Bool(),
-	Number = Compression.UInt(),
-	String = Compression.CompressedString(),
+local PlayerSchema =
+	Compression.Schema({
+		Coins =
+			Compression.UInt(),
 
-	Health = Compression.Quantized(
-		0,
-		100,
-		8
-	),
-}, 1)
+		Rebirths =
+			Compression.UInt(),
+
+		Enabled =
+			Compression.Bool(),
+
+		Name =
+			Compression.CompressedString(),
+
+		Position =
+			Compression.Vector3(),
+
+		UIPosition =
+			Compression.UDim2(),
+
+		LastSeen =
+			Compression.DateTime(),
+	}, 1)
 ```
 
 Encode:
 
 ```lua
-local data = {
-	Boolean = true,
-	Number = 123,
-	String = "Hello Hello Hello Hello Hello Hello",
-	Health = 97,
-}
-
-local packet = Schema:Encode(
-	data,
-	{
-		Mode = "BinaryWithHash",
-	}
-)
+local packet =
+	PlayerSchema:Encode({
+		Coins = 1_000_000,
+		Rebirths = 25,
+		Enabled = true,
+		Name = "Player_001",
+		Position = Vector3.new(1, 2, 3),
+		UIPosition = UDim2.new(0.5, 0, 1, -100),
+		LastSeen = DateTime.now(),
+	})
 ```
 
 Decode:
 
 ```lua
 local restored =
-	Schema:Decode(packet)
+	PlayerSchema:Decode(
+		packet
+	)
 ```
+
+Schema packets carry the schema version and reject incompatible schema versions.
 
 ---
 
 # Descriptor API
 
-Available descriptor constructors include:
+v2.3.1 includes the following descriptor constructors:
 
 | Descriptor | Purpose |
 | --- | --- |
 | `Compression.Bool()` | Boolean |
 | `Compression.UInt()` | Unsigned integer |
 | `Compression.Int()` | Signed integer |
-| `Compression.Float()` | Floating-point number |
-| `Compression.String()` | Raw string |
-| `Compression.CompressedString()` | Compressible string |
-| `Compression.Buffer()` | Buffer |
+| `Compression.Float()` | 64-bit number |
+| `Compression.String()` | String |
+| `Compression.CompressedString(options?)` | String using Compression string codecs |
+| `Compression.Buffer(options?)` | Buffer |
 | `Compression.Vector2()` | Vector2 |
 | `Compression.Vector3()` | Vector3 |
-| `Compression.Color3()` | Color3 |
+| `Compression.Color3()` | Lossless Color3 |
 | `Compression.CFrame()` | CFrame |
+| `Compression.UDim()` | UDim |
+| `Compression.UDim2()` | UDim2 |
+| `Compression.Rect()` | Rect |
+| `Compression.NumberRange()` | NumberRange |
+| `Compression.BrickColor()` | BrickColor |
+| `Compression.DateTime()` | DateTime |
 | `Compression.Array(descriptor)` | Array |
 | `Compression.Object(fields)` | Structured object |
+| `Compression.Optional(descriptor)` | Optional value |
 | `Compression.Quantized(min, max, bits)` | Quantized number |
 | `Compression.QuantizedVector3(min, max, bits)` | Quantized Vector3 |
-| `Compression.Optional(descriptor)` | Optional field |
 
 ---
 
-# Schema Versioning
+## Lossless Color3 schema descriptor
 
-Schemas can define an explicit version.
+v2.3.x fixed the older schema Color3 behavior.
 
-```lua
-local Schema = Compression.Schema({
-	Coins = Compression.UInt(),
-}, 3)
+The schema descriptor now adaptively chooses an exact representation:
+
+```text
+RGB8
+Float32
+Float64
 ```
 
-The version is embedded in the encoded packet.
-
-This prevents a packet intended for one schema version from silently being decoded using an incompatible schema definition.
+This allows arbitrary Color3 values to round-trip without silently quantizing them to RGB8.
 
 ---
 
-# Delta Encoding
+# Optional Fields
 
-Schemas support delta packets.
+```lua
+local Schema =
+	Compression.Schema({
+		Coins =
+			Compression.UInt(),
+
+		Note =
+			Compression.Optional(
+				Compression.String()
+			),
+	}, 1)
+```
+
+Both are valid:
+
+```lua
+Schema:Encode({
+	Coins = 100,
+	Note = "Hello",
+})
+```
+
+and:
+
+```lua
+Schema:Encode({
+	Coins = 100,
+})
+```
+
+Required fields cannot be silently removed by a delta packet in v2.3.1.
+
+---
+
+# Schema Delta Encoding
+
+Schemas support compact change packets.
+
+```lua
+local Schema =
+	Compression.Schema({
+		Coins =
+			Compression.UInt(),
+
+		Level =
+			Compression.UInt(),
+
+		Enabled =
+			Compression.Bool(),
+	}, 1)
+```
+
+Old value:
 
 ```lua
 local previous = {
 	Coins = 100,
 	Level = 5,
+	Enabled = true,
 }
+```
 
+New value:
+
+```lua
 local current = {
 	Coins = 150,
-	Level = 6,
+	Level = 5,
+	Enabled = true,
 }
+```
 
+Encode only the changes:
+
+```lua
 local delta =
 	Schema:EncodeDelta(
 		previous,
 		current
 	)
+```
 
+Apply them:
+
+```lua
 local restored =
 	Schema:DecodeDelta(
 		previous,
@@ -925,57 +2249,304 @@ local restored =
 	)
 ```
 
-Delta packets are useful when only a small portion of the payload changes.
+v2.3.1 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
 
 ---
 
-# Dynamic String Dictionary
+# Descriptor Inference
 
-Dynamic payloads can detect repeated strings and place them into a shared dictionary.
-
-Later occurrences can reference a compact dictionary ID.
+Generate a descriptor from a sample value:
 
 ```lua
-local packet = Compression.Encode(
-	data,
+local descriptor =
+	Compression.InferDescriptor({
+		Coins = 100,
+		Enabled = true,
+		Name = "Player",
+	})
+```
+
+Or:
+
+```lua
+local descriptor =
+	Compression.AutoDescriptor(
+		value
+	)
+```
+
+v2.3.x recognizes:
+
+```text
+UDim
+UDim2
+Rect
+NumberRange
+BrickColor
+DateTime
+```
+
+in addition to the older primitive and Roblox types.
+
+Object-array inference also validates that every object has a compatible nested descriptor shape.
+
+For example, this is compatible:
+
+```lua
+{
 	{
-		UseStringDictionary = true,
-		DictionaryMinUses = 2,
-		MaxDictionaryEntries = 255,
-	}
-)
+		Coins = 100,
+		Enabled = true,
+	},
+
+	{
+		Coins = 200,
+		Enabled = false,
+	},
+}
 ```
 
-Disable the dictionary with:
-
-```lua
-UseStringDictionary = false
-```
+while incompatible object structures are rejected instead of producing a descriptor that will fail later.
 
 ---
 
-# Integrity Hash
+# Quantized Values
 
-Packets can optionally include an FNV-1a integrity hash.
+Quantization is intentionally different from the normal lossless codecs.
+
+Use it only when bounded precision is acceptable.
+
+Example:
 
 ```lua
-local packet = Compression.Encode(
-	data,
-	{
-		Mode = "BinaryWithHash",
-	}
-)
+local Health =
+	Compression.Quantized(
+		0,
+		100,
+		8
+	)
+```
 
+Vector3:
+
+```lua
+local Position =
+	Compression.QuantizedVector3(
+		Vector3.new(
+			-1000,
+			-1000,
+			-1000
+		),
+
+		Vector3.new(
+			1000,
+			1000,
+			1000
+		),
+
+		16
+	)
+```
+
+The constructors validate invalid ranges in v2.3.x.
+
+---
+
+# Integrity Hashes
+
+Packets can include an FNV-1a integrity hash.
+
+```lua
+local packet =
+	Compression.Encode(
+		data,
+		{
+			Mode = "BinaryWithHash",
+		}
+	)
+```
+
+Verify:
+
+```lua
+print(
+	Compression.Verify(
+		packet
+	)
+)
+```
+
+Or inspect:
+
+```lua
 print(packet.Hash)
 ```
 
-When hash verification is enabled, corrupted payloads can be rejected during decoding.
+Hash verification is intended to detect accidental corruption, not provide cryptographic authentication.
+
+---
+
+# Statistics and Analysis
+
+## AutoStats
+
+```lua
+local stats =
+	Compression.AutoStats(value)
+
+print(stats.ValueType)
+print(stats.Codec)
+
+print(stats.RawBytes)
+print(stats.Bytes)
+
+print(stats.SavedBytes)
+print(stats.ExpandedBytes)
+
+print(stats.UsefulBits)
+print(stats.PhysicalBits)
+print(stats.PaddingBits)
+
+print(stats.SavingsPercent)
+print(stats.ExpansionPercent)
+```
+
+Formatted:
+
+```lua
+Compression.PrintAutoStats(
+	value
+)
+```
+
+---
+
+## NumberStats
+
+```lua
+local stats =
+	Compression.NumberStats(
+		123.456789
+	)
+```
+
+Includes:
+
+```text
+RawBytes
+RawBits
+Bytes
+Bits
+UsefulBits
+PhysicalBits
+SavedBytes
+SavedBits
+ExpandedBytes
+ExpandedBits
+SavingsPercent
+ExpansionPercent
+Ratio
+IsSmaller
+```
+
+---
+
+## TableStats
+
+```lua
+local stats =
+	Compression.TableStats(data)
+
+print(stats.Mode)
+print(stats.Format)
+
+print(stats.RawBytes)
+print(stats.Bytes)
+
+print(stats.Mapped)
+print(stats.MappedKeys)
+print(stats.AvailableMappedKeys)
+
+print(stats.MappedCompactBytes)
+print(stats.UnmappedCompactBytes)
+print(stats.MappingSavedBytes)
+print(stats.MappingSavingsPercent)
+
+print(stats.UsefulBits)
+print(stats.PhysicalBits)
+print(stats.PaddingBits)
+```
+
+Formatted:
+
+```lua
+Compression.PrintTableStats(
+	data
+)
+```
+
+---
+
+## Generic Stats
+
+```lua
+local packet =
+	Compression.Pack(value)
+
+local stats =
+	Compression.Stats(packet)
+```
+
+---
+
+## Analyze
+
+```lua
+local analysis =
+	Compression.Analyze(value)
+
+print(analysis.Codec)
+print(analysis.Bytes)
+print(analysis.RawBytes)
+```
+
+---
+
+## Table structure
+
+Inspect the contents of a nested table:
+
+```lua
+local structure =
+	Compression.TableStructure(data)
+
+print(structure.Tables)
+print(structure.Arrays)
+print(structure.Maps)
+
+print(structure.Booleans)
+print(structure.Numbers)
+print(structure.Strings)
+print(structure.Buffers)
+
+print(structure.Vector2s)
+print(structure.Vector3s)
+print(structure.Color3s)
+print(structure.CFrames)
+
+print(structure.UDims)
+print(structure.UDim2s)
+print(structure.Rects)
+print(structure.NumberRanges)
+print(structure.BrickColors)
+print(structure.DateTimes)
+```
 
 ---
 
 # Bit Layout Analysis
 
-Schemas can report how the encoded payload uses its bits.
+Schemas can show exactly how their bits are used.
 
 ```lua
 local layout =
@@ -988,19 +2559,19 @@ print(layout.PhysicalBits)
 print(layout.PhysicalBytes)
 ```
 
-A formatted report is also available:
+Formatted report:
 
 ```lua
 Schema:PrintBitLayout(data)
 ```
 
-This is useful for tuning frequently replicated or stored payloads.
+This is useful when tuning frequently serialized structures.
 
 ---
 
 # Configuration
 
-Common options include:
+Common options:
 
 ```lua
 {
@@ -1022,6 +2593,11 @@ Common options include:
 	DeltaArrays = true,
 	RunLengthArrays = true,
 	CompactMapKeys = true,
+
+	TableKeyMapping = true,
+	MappedKeyMinUses = 2,
+	MaxMappedKeys = 255,
+
 	TableStrategy = "Auto",
 
 	CompressBuffers = true,
@@ -1038,72 +2614,337 @@ Common options include:
 }
 ```
 
+Not every option needs to be specified.
+
+The normal high-level call can simply use defaults:
+
+```lua
+local packet =
+	Compression.Pack(value)
+```
+
 ---
 
-# v2.2.1
+## StringStrategy
 
-v2.2.1 builds on the v2.2 internal restructuring and improves compact scalar and Roblox datatype compression.
+```text
+Auto
+Raw
+LZ
+ASCII7
+Identifier6
+Numeric4
+```
 
-## Primitive values
+---
 
-- Compact boolean payload metadata
-- Compact integer paths
-- Compact decimal representation
-- Float32-compatible scalar representation
-- Improved no-expansion fallback behavior
+## BufferStrategy
 
-## Roblox datatypes
+```text
+Auto
+Raw
+LZ
+Sparse
+Nibble
+```
 
-- Compact Vector2 encoding
-- Compact Vector3 encoding
-- Compact Color3 encoding
-- Compact CFrame encoding
-- Float32 CFrame fallback for complex transforms
+---
+
+## TableStrategy
+
+```text
+Auto
+Compact
+Dynamic
+```
+
+---
+
+## Mode
+
+```text
+Binary
+BinaryWithHash
+```
+
+---
+
+# Public API Overview
+
+v2.3.1 exposes 80 public functions.
+
+## Strings
+
+```text
+CompressString
+DecompressString
+StringMode
+StringStats
+PrintStringStats
+TryDecompressString
+CompressStringSmart
+DecompressStringSmart
+```
 
 ## Buffers
 
-- Zero
-- Fill
-- SparseZero
-- SparsePower2
-- Nibble4
-- NibbleHigh4
-- LZ
-- Raw passthrough
+```text
+CompressBuffer
+DecompressBuffer
+BufferMode
+BufferFrameVersion
+BufferStats
+PrintBufferStats
+TryDecompressBuffer
+CompressBufferSmart
+DecompressBufferSmart
+```
+
+## Generic / Adaptive
+
+```text
+Encode
+Decode
+Compress
+Decompress
+Auto
+AutoDecompress
+TryAuto
+CanAuto
+TryAutoDecompress
+AutoStats
+PrintAutoStats
+
+Pack
+Unpack
+TryPack
+TryUnpack
+Size
+Codec
+```
+
+## Numbers
+
+```text
+CompressNumber
+DecompressNumber
+NumberStats
+```
 
 ## Tables
 
-- Bit-packed boolean arrays
-- Compact unsigned integer arrays
-- Compact signed integer arrays
-- Compact float arrays
-- Compact string arrays
-- Delta arrays
-- Run-length arrays
-- Compact string maps
-- Nested tables
-- Buffers and Roblox datatypes inside tables
-
-## Stability
-
-v2.2 reorganized large groups of internal constants and codec state to reduce top-level Luau register pressure.
-
-This resolved module load failures such as:
-
 ```text
-Out of local registers
-exceeded limit 200
+CompressTable
+CompressTablePacket
+DecompressTable
+TryDecompressTable
+IsCompactTable
+TableMode
+TableBytes
+TableEntries
+TableStructure
+TableStats
+PrintTableStats
+EstimateRawBytes
 ```
 
-The public API remains compatible with the v2 series.
+## Schemas
+
+```text
+Schema
+Optional
+
+Bool
+UInt
+Int
+Float
+String
+CompressedString
+Buffer
+
+Vector2
+Vector3
+Color3
+CFrame
+UDim
+UDim2
+Rect
+NumberRange
+BrickColor
+DateTime
+
+Array
+Object
+Quantized
+QuantizedVector3
+
+InferDescriptor
+AutoDescriptor
+```
+
+## Integrity / Analysis
+
+```text
+Hash
+Verify
+FormatBytes
+Stats
+Analyze
+Version
+```
+
+---
+
+# Backward Compatibility
+
+v2.3.1 uses:
+
+```text
+Binary format: 22
+```
+
+v2.3.1 intentionally keeps the same binary format as v2.3.0.
+
+The decoder also retains support for compatible earlier formats handled by the v2.x decoder.
+
+This means the v2.3.1 patch did not require another storage-format revision.
+
+As with any serialization system, test persisted production data before deploying a major codec or schema change.
+
+---
+
+# v2.3.1 Patch Notes
+
+v2.3.1 is a bug-fix release built on the v2.3.0 API.
+
+## Empty-string atom fix
+
+This now works correctly even when expansion is allowed:
+
+```lua
+local packet =
+	Compression.Pack(
+		"",
+		{
+			AllowExpansion = true,
+		}
+	)
+
+local restored =
+	Compression.Unpack(
+		packet
+	)
+```
+
+Result:
+
+```lua
+restored == ""
+```
+
+---
+
+## Required schema delta fields
+
+Required fields can no longer be removed through `EncodeDelta()`.
+
+For example:
+
+```lua
+local Schema =
+	Compression.Schema({
+		Coins =
+			Compression.UInt(),
+
+		Enabled =
+			Compression.Bool(),
+	}, 1)
+```
+
+This is invalid:
+
+```lua
+previous = {
+	Coins = 100,
+	Enabled = true,
+}
+
+current = {
+	Enabled = true,
+}
+```
+
+because `Coins` is required.
+
+Use:
+
+```lua
+Compression.Optional(...)
+```
+
+if a field is allowed to disappear.
+
+---
+
+## Delta validation
+
+v2.3.1 validates the complete resulting schema state, including unchanged values.
+
+Invalid values cannot bypass descriptor checks simply because they did not change.
+
+---
+
+## Schema input errors
+
+Calls such as:
+
+```lua
+Schema:Encode(123)
+```
+
+now fail with a clear schema-specific error.
+
+The same applies to invalid `AnalyzeBits()` and delta inputs.
+
+---
+
+## Descriptor inference fixes
+
+Arrays of structured objects now require compatible recursive descriptor shapes.
+
+This avoids generating an `Array<Object>` descriptor from objects that contain completely different fields.
+
+---
+
+## Decoder allocation guards
+
+Container counts are checked before large allocations.
+
+The decoder uses a hard container-item ceiling in addition to payload-bound validation.
+
+This helps reject malformed or corrupted payloads before attempting huge `table.create()` calls.
+
+---
+
+## Dynamic dictionary validation
+
+Duplicate dynamic string-dictionary entries are rejected during decode.
+
+---
+
+## Format compatibility
+
+v2.3.1 remains:
+
+```text
+Format 22
+```
+
+so it stays directly compatible with the v2.3.0 format.
 
 ---
 
 # Version
-
-```text
-2.2.1
-```
 
 ```lua
 print(
@@ -1111,8 +2952,69 @@ print(
 )
 ```
 
-Expected output:
+Expected:
 
 ```text
-2.2.1
+2.3.1
 ```
+
+---
+
+# Recommended Starting Point
+
+For most code:
+
+```lua
+local packet =
+	Compression.Pack(value)
+
+local restored =
+	Compression.Unpack(packet)
+```
+
+For debugging:
+
+```lua
+local stats =
+	Compression.AutoStats(value)
+
+print(stats.Codec)
+print(stats.RawBytes)
+print(stats.Bytes)
+print(stats.SavingsPercent)
+```
+
+For fixed structures:
+
+```lua
+local Schema =
+	Compression.Schema({
+		Coins =
+			Compression.UInt(),
+
+		Enabled =
+			Compression.Bool(),
+	}, 1)
+```
+
+For repeated nested records:
+
+```lua
+local packet =
+	Compression.CompressTablePacket(
+		data,
+		{
+			TableStrategy = "Auto",
+			TableKeyMapping = true,
+		}
+	)
+```
+
+For calls that should not throw:
+
+```lua
+local ok, packet, err =
+	Compression.TryPack(value)
+```
+
+That covers the main v2.3.1 workflow.
