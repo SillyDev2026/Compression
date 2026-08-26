@@ -1,12 +1,14 @@
 # Compression
 
-**Current version: v2.5.5**  
-**Binary format: 24**  
+**Current version: v2.6.4**  
+**Binary format: 25**  
 **Public API: 85 functions**
 
-Compression is a type-aware binary serialization and compression library for Roblox/Luau focused on compact payloads, predictable round trips, expansion-safe codec selection, and practical game-data/network serialization.
+Compression is a high-performance binary serialization and adaptive data-compression library for Roblox/Luau, built to reduce network and storage payloads without sacrificing reliability, type safety, or exact restoration.
 
-It supports primitive values, Roblox datatypes, strings, buffers, arrays, maps, nested tables, schemas, delta packets, repeated-string dictionaries, table-key mapping, canonical Huffman entropy coding, integrity hashes, bit-layout analysis, and adaptive codec selection.
+v2.6.4 analyzes supported values and selects the smallest safe representation available. Specialized codecs can be followed by canonical Huffman entropy compression, while expansion-safe Auto paths fall back to raw data whenever a candidate would make the payload larger.
+
+It supports primitive values, Roblox datatypes, strings, buffers, arrays, maps, deeply nested tables, schemas, delta packets, repeated-string dictionaries, table-key mapping, canonical Huffman entropy coding, integrity hashes, bit-layout analysis, corruption guards, decode-size limits, and adaptive codec selection.
 
 The main rule of the library is:
 
@@ -50,8 +52,9 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - [Integrity Hashes](#integrity-hashes)
 - [Statistics and Analysis](#statistics-and-analysis)
 - [Configuration](#configuration)
+- [Performance Benchmarks](#performance-benchmarks)
 - [Backward Compatibility](#backward-compatibility)
-- [v2.5.5 Patch Notes](#v255-patch-notes)
+- [v2.6.4 Patch Notes](#v264-patch-notes)
 - [Version](#version)
 - [Download](#download)
 
@@ -85,6 +88,7 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
   - Raw framed
   - Zero
   - Fill
+  - ZeroRun
   - SparseZero
   - SparsePower2
   - Nibble4
@@ -116,7 +120,11 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - Backward decoding support for compatible older binary formats
 - Legacy short `SparsePower2` recovery and malformed-padding validation
 - Top-level buffer type preservation through entropy framing
-- Reduced top-level Luau register pressure
+- Expansion-safe ZeroRun buffer framing for zero-heavy small and medium buffers
+- Allocation-reduced Auto buffer analysis and lazy raw fallback
+- Faster canonical Huffman encode/decode hot paths
+- Decode-size protection for compressed buffer frames
+- Reduced top-level Luau register pressure with v2.6.4 compiler headroom
 
 ---
 
@@ -202,7 +210,7 @@ local value = Compression.Unpack(packet)
 
 # Pack and Unpack
 
-`Pack()` is the recommended high-level call in v2.5.x.
+`Pack()` is the recommended high-level call in v2.6.x.
 
 ```lua
 local packet = Compression.Pack(value)
@@ -310,7 +318,7 @@ if not ok then
 end
 ```
 
-The v2.5.x `Try*` APIs return useful error text:
+The v2.6.x `Try*` APIs return useful error text:
 
 ```text
 success, value, nil
@@ -336,9 +344,9 @@ Compression.TryDecompressTable(...)
 
 # Real Compression Examples
 
-The following measurements come from the **Compression v2.5.5 full Huffman/regression suite**.
+The following measurements come from the **Compression v2.6.4 full Huffman/regression suite**.
 
-Compression ratios are input-dependent. These are measured examples, not guaranteed ratios for every value. v2.5.5 completed **122 tests passed, 0 failed, 0 skipped**.
+Compression ratios are input-dependent. These are measured examples, not guaranteed ratios for every value. v2.6.4 completed **132 tests passed, 0 failed, 0 skipped**.
 
 ## Primitive numbers
 
@@ -373,6 +381,8 @@ Arbitrary Float64 values such as `math.pi` can remain at 8 bytes when no exact s
 | --- | --- | ---: | ---: | ---: |
 | Zero buffer | `Zero` | 512 B | **4 B** | **99.22%** |
 | One-byte fill | `Fill` | 512 B | **5 B** | **99.02%** |
+| Small aligned Float64 buffer | `ZeroRun` | 12 B | **11 B** | **8.33%** |
+| Small aligned `Float64(3)` buffer | `ZeroRun` | 12 B | **5 B** | **58.33%** |
 | Sparse zero | `Huffman/SparseZero` | 256 B | **38 B** | **85.16%** |
 | Sparse powers-of-two | `Huffman/SparsePower2` | 256 B | **35 B** | **86.33%** |
 | Nibble-compatible | `Huffman/Nibble4` | 512 B | **136 B** | **73.44%** |
@@ -399,7 +409,7 @@ The random-buffer result is intentional: `Auto` rejects candidates that would ex
 
 These values use the test suite's raw-size estimate for the original logical data.
 
-| Value | Raw estimate / no-entropy | v2.5.5 Auto | Selected path |
+| Value | Raw estimate / no-entropy | v2.6.4 Auto | Selected path |
 | --- | ---: | ---: | --- |
 | Boolean array | 2,313 B | **34 B** | `CompactBoolArray` + entropy frame |
 | UInt delta array | 8,192 B | **93 B** | `CompactUIntDeltaArray` + Huffman |
@@ -415,8 +425,8 @@ A representative nested player-data table measured:
 
 ```text
 Entropy=None: 1311 B
-Auto/Huffman:  759 B
-Saved:         552 B
+Auto/Huffman:  761 B
+Saved:         550 B
 ```
 
 A representative schema measured:
@@ -476,7 +486,7 @@ packet.EntropySavedBytes
 
 Not every field is meaningful for every packet, so some metadata can be `nil`.
 
-v2.5.5 keeps byte-level and bit-level accounting separate. `ByteDelta` compares physical encoded bytes with the raw byte estimate, while `BitDelta` compares useful encoded bits with the raw bit estimate.
+v2.6.4 keeps byte-level and bit-level accounting separate. `ByteDelta` compares physical encoded bytes with the raw byte estimate, while `BitDelta` compares useful encoded bits with the raw bit estimate.
 
 ## Useful Bits vs Physical Bits
 
@@ -722,7 +732,7 @@ Keeps the original bytes when specialized codecs would not help. Raw payloads ar
 
 ## Numeric4
 
-Optimized for numeric text using the supported numeric alphabet. In the v2.5.5 suite, a 40-byte numeric string encoded to 22 bytes.
+Optimized for numeric text using the supported numeric alphabet. In the v2.6.4 suite, a 40-byte numeric string encoded to 22 bytes.
 
 ## Identifier6
 
@@ -793,6 +803,7 @@ Current first-stage output modes include:
 | `Raw` | Framed raw representation |
 | `Zero` | All bytes are zero |
 | `Fill` | One repeated byte |
+| `ZeroRun` | Removes one profitable contiguous zero run and reconstructs it exactly |
 | `SparseZero` | Mostly-zero buffers |
 | `SparsePower2` | Sparse powers-of-two values |
 | `Nibble4` | Values fit in low four bits |
@@ -805,11 +816,13 @@ After the first-stage codec, canonical Huffman can be selected automatically whe
 
 `Auto` compares available representations and keeps the smallest safe result. It does not force compression merely because a codec is valid.
 
-Measured v2.5.5 examples:
+Measured v2.6.4 examples:
 
 ```text
 Zero:              512 B ->    4 B
 Fill:              512 B ->    5 B
+ZeroRun small:       12 B ->   11 B
+ZeroRun Float64(3):  12 B ->    5 B
 SparseZero:        256 B ->   38 B  with Huffman
 SparsePower2:      256 B ->   35 B  with Huffman
 Nibble4:           512 B ->  136 B  with Huffman
@@ -820,24 +833,31 @@ Random:           2048 B -> 2048 B  RawPassthrough
 
 ## Small and high-entropy buffers
 
-A small buffer can legitimately remain unchanged.
+Small buffers are only compressed when the complete representation is actually smaller.
 
-For example, a 12-byte buffer containing one `i8`, three padding zeros, and an arbitrary Float64 may report:
+A measured 12-byte buffer containing one `i8`, padding zeros, and an arbitrary aligned Float64 used `ZeroRun`:
 
 ```text
-Type: buffer
-Codec: PassthroughBuffer
-Raw: 12 B
-Encoded: 12 B
-Saved: 0 B
-Savings: 0.00%
-Ratio: 1.0000x
+Raw:       12 B
+Encoded:   11 B
+Mode:      ZeroRun
+Saved:      1 B
+Savings:    8.33%
 ```
 
-This is expected. The Float64 bytes can have high entropy, while LZ, Sparse, Nibble, and Huffman framing each add metadata. The default `HuffmanMinBytes` is 16, so `Auto` does not attempt per-packet Huffman on a 12-byte candidate by default.
+When the aligned Float64 is exactly `3`, the byte pattern contains a much longer zero run:
 
-If the layout is known ahead of time, prefer a Schema or typed representation instead of first serializing the fields into an opaque padded buffer. Schemas can omit repeated type metadata and avoid transmitting application-level padding entirely.
+```text
+Raw:       12 B
+Encoded:    5 B
+Mode:      ZeroRun
+Saved:      7 B
+Savings:   58.33%
+```
 
+High-entropy data still remains raw when specialized codecs and Huffman cannot beat the source. The v2.6.4 suite keeps a 2,048-byte random buffer at exactly 2,048 bytes.
+
+The default `HuffmanMinBytes` is 16, so tiny first-stage candidates normally skip Auto Huffman. For known structures, a Schema can still be preferable because it avoids transmitting application-level padding and repeated type information.
 ## Expansion safety
 
 With `AllowExpansion = false`, forced LZ and Auto paths can fall back to raw when their encoded representation would be larger.
@@ -868,7 +888,7 @@ Compression.PrintBufferStats(value)
 
 # Huffman Entropy Coding
 
-v2.5.5 includes a **canonical Huffman** entropy layer. It is a second-stage codec: Compression first applies the best type-aware representation, then Huffman may reduce that byte stream further.
+v2.6.4 includes a **canonical Huffman** entropy layer. It is a second-stage codec: Compression first applies the best type-aware representation, then Huffman may reduce that byte stream further.
 
 Typical pipeline:
 
@@ -945,7 +965,7 @@ Standalone booleans and compact boolean data do not need per-value Huffman codin
 
 # Roblox Datatypes
 
-Compression v2.5.5 supports these Roblox datatypes directly:
+Compression v2.6.4 supports these Roblox datatypes directly:
 
 ```text
 Vector2
@@ -1262,7 +1282,7 @@ local packet =
 	)
 ```
 
-If a value cannot be represented by the Compact format, v2.5.x can fall back to Dynamic instead of breaking the entire table encode.
+If a value cannot be represented by the Compact format, v2.6.x can fall back to Dynamic instead of breaking the entire table encode.
 
 ---
 
@@ -1626,7 +1646,7 @@ Disable it:
 UseStringDictionary = false
 ```
 
-v2.5.5 rejects malformed payloads containing duplicate dictionary entries.
+v2.6.4 rejects malformed payloads containing duplicate dictionary entries.
 
 ---
 
@@ -1724,7 +1744,7 @@ Measured:
 41.34% saved
 ```
 
-Newer v2.5.x Dynamic tables also support:
+Newer v2.6.x Dynamic tables also support:
 
 ```text
 UDim
@@ -1766,16 +1786,15 @@ local restored =
 	)
 ```
 
-A previous measured example:
+Measured v2.6.4 examples:
 
 ```text
-Raw:        12 B
-Compressed: 5 B
-Mode:       SparsePower2
-Savings:    58.33%
+Bnum-like 1,3:     12 B -> 5 B   ZeroRun
+Bnum-like -1,3:    12 B -> 5 B   ZeroRun
+Bnum-like 1,1000:  12 B -> 6 B   ZeroRun
 ```
 
-The selected buffer mode depends on the actual buffer contents.
+The selected buffer mode still depends on the exact byte layout, but these current regression cases all choose `ZeroRun`.
 
 ---
 
@@ -1841,7 +1860,7 @@ Schema packets carry the schema version and reject incompatible schema versions.
 
 # Descriptor API
 
-v2.5.5 includes the following descriptor constructors:
+v2.6.4 includes the following descriptor constructors:
 
 | Descriptor | Purpose |
 | --- | --- |
@@ -1872,7 +1891,7 @@ v2.5.5 includes the following descriptor constructors:
 
 ## Lossless Color3 schema descriptor
 
-v2.5.x fixed the older schema Color3 behavior.
+v2.6.x fixed the older schema Color3 behavior.
 
 The schema descriptor now adaptively chooses an exact representation:
 
@@ -1918,7 +1937,7 @@ Schema:Encode({
 })
 ```
 
-Required fields cannot be silently removed by a delta packet in v2.5.5.
+Required fields cannot be silently removed by a delta packet in v2.6.4.
 
 ---
 
@@ -1980,7 +1999,7 @@ local restored =
 	)
 ```
 
-v2.5.5 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
+v2.6.4 validates both changed and unchanged schema state, and required fields cannot be removed through delta encoding.
 
 ---
 
@@ -2006,7 +2025,7 @@ local descriptor =
 	)
 ```
 
-v2.5.x recognizes:
+v2.6.x recognizes:
 
 ```text
 UDim
@@ -2079,7 +2098,7 @@ local Position =
 	)
 ```
 
-The constructors validate invalid ranges in v2.5.x.
+The constructors validate invalid ranges in v2.6.x.
 
 ---
 
@@ -2415,7 +2434,7 @@ BinaryWithHash
 
 # Public API Overview
 
-v2.5.5 exposes **85 public functions**.
+v2.6.4 exposes **85 public functions**
 
 ## Huffman / Entropy
 
@@ -2552,178 +2571,212 @@ Default:
 AllowExpansion = false
 ```
 
-In v2.5.5 this applies consistently to forced string codecs, forced buffer LZ, and forced Huffman behavior.
+In v2.6.4 this applies consistently to forced string codecs, forced buffer LZ, and forced Huffman behavior.
 
 With the default setting, explicit codecs may safely fall back to raw when their frame is larger. Set `AllowExpansion = true` when you intentionally want to benchmark the requested codec even when it expands.
 
 ---
 
-# Backward Compatibility
+# Performance Benchmarks
 
-v2.5.5 writes:
+The following measurements are from the v2.6.4 full Roblox Studio regression benchmark. Timing is machine- and workload-dependent; use these values as a reference for this test corpus rather than universal guarantees.
+
+Packing sizes remained:
 
 ```text
-Binary format: 24
+String: 412 B -> 190 B
+Buffer: 338 B -> 139 B
+Table:  1311 B -> 761 B
 ```
 
-The v2.5.5 decoder still accepts compatible binary versions **23 through 6** on the generic binary path, and compatible compact-number versions handled by the v2.x decoder.
+Measured throughput:
+
+| Operation | v2.6.4 |
+| --- | ---: |
+| Auto encode string - Entropy=None | 3562.568 us/op |
+| Auto encode string - Huffman Auto | 3911.334 us/op |
+| Auto decode string - Entropy=None | 354.120 us/op |
+| Auto decode string - Huffman Auto | 452.403 us/op |
+| Auto encode buffer - Entropy=None | **1258.030 us/op** |
+| Auto encode buffer - Huffman Auto | **1348.945 us/op** |
+| Auto decode buffer - Entropy=None | **31.627 us/op** |
+| Auto decode buffer - Huffman Auto | 106.248 us/op |
+| Auto encode table - Entropy=None | **316.943 us/op** |
+| Auto encode table - Huffman Auto | **1320.819 us/op** |
+| Auto decode table - Entropy=None | 84.580 us/op |
+| Auto decode table - Huffman Auto | 493.942 us/op |
+| Direct Huffman encode 8 KiB | **843.921 us/op** |
+| Direct Huffman decode 8 KiB | **508.772 us/op** |
+
+Compared with v2.6.2 on the same regression workload, the largest measured improvements were approximately:
+
+```text
+Buffer encode, no entropy:   ~19% faster
+Buffer encode, Huffman Auto: ~19% faster
+Table encode, no entropy:    ~24% faster
+Table encode, Huffman Auto:  ~15% faster
+Direct Huffman encode:       ~27% faster
+Direct Huffman decode:       ~11% faster
+```
+
+v2.6.4 intentionally keeps compression quality and wire compatibility ahead of benchmark-only speed changes. Always run your own representative network/DataStore workload before choosing aggressive entropy settings.
+
+---
+
+# Backward Compatibility
+
+v2.6.4 writes:
+
+```text
+Binary format: 25
+```
+
+The generic decoder accepts the current format plus compatible binary versions **24 through 6**. The compact-number decoder retains compatible legacy handling for the versions implemented by the v2.x decoder, and the buffer decoder keeps recovery support for the affected legacy v2.3.1 short `SparsePower2` representation.
 
 Important release progression:
 
 ```text
-v2.3.x -> format 22
-v2.4.0 -> format 23
-v2.5.5 -> format 24
+v2.3.x  -> format 22
+v2.4.0  -> format 23
+v2.5.x  -> format 24
+v2.6.x  -> format 25
 ```
 
-Format 24 was introduced because schema bit/byte alignment was corrected. The decoder also keeps recovery support for the affected legacy v2.3.1 short `SparsePower2` representation.
+Format 25 was introduced for the v2.6 buffer-frame generation, including the `ZeroRun` path. v2.6.4 does not introduce another wire-format change; it keeps format 25 while improving implementation speed, safety, and Luau compiler headroom.
 
 As with any serialization system, validate persisted production data and schema migrations before deploying a format-changing update.
 
 ---
+# v2.6.4 Patch Notes
 
-# v2.5.5 Patch Notes
-
-v2.5.5 is a correctness, compatibility, and entropy-compression release built on the v2.4 Huffman architecture.
-
-```text
-Version:       2.5.5
-Binary format: 24
-Public API:    85 functions
-Regression:    122 passed / 0 failed / 0 skipped
-```
-
-## Canonical Huffman entropy layer
-
-The module now supports canonical Huffman coding directly and as an optional second-stage entropy codec.
-
-New public APIs:
+v2.6.4 is the stable performance, safety, and Luau compiler-fix release for the v2.6 branch.
 
 ```text
-HuffmanEncode
-HuffmanDecode
-TryHuffman
-IsHuffman
-HuffmanStats
+Version:          2.6.4
+Binary format:    25
+Public API:       85 functions
+Regression:       132 passed / 0 failed / 0 skipped
+Top-level locals: 191
 ```
 
-Auto Huffman measures the complete frame, including symbol/code-length metadata, and keeps the original representation when Huffman is not smaller.
-
-## Type-aware compression before Huffman
-
-Huffman does not replace existing codecs. It runs after specialized representations such as:
+## v2.6 branch summary
 
 ```text
-VarUInt / ZigZag VarInt
-exact Float32 / Float64 selection
-Numeric4 / Identifier6 / ASCII7
-LZ
-SparseZero / SparsePower2
-Nibble4 / NibbleHigh4
-RLE arrays
-delta arrays
-compact tables
-dynamic dictionaries
-Roblox datatype arrays
+v2.6.0  ZeroRun buffer frame introduced
+v2.6.1  Generic Auto/Decode recognition fixed for ZeroRun
+v2.6.2  Buffer decode-size hardening and option validation
+v2.6.3  Performance refactor, but exceeded Luau's 200-local module limit
+v2.6.4  Register-pressure fix while preserving the v2.6.3 optimizations
 ```
 
-This keeps the system optimized for Roblox-shaped data instead of treating every value as an undifferentiated byte blob.
+## ZeroRun buffer compression
 
-## Boolean Huffman bypass
+`ZeroRun` removes one profitable contiguous zero run and stores compact reconstruction metadata. It is lossless and especially useful for aligned numeric buffers that contain long stretches of zero bytes.
 
-Standalone booleans remain on the one-useful-bit compact path and do not use Huffman per value.
-
-## Schema alignment regression fix
-
-v2.4 could leave a boolean/optional bit pending while the next byte-oriented schema descriptor started writing. That shifted following payload bytes and could produce `invalid number payload` during decode.
-
-v2.5.5 flushes/alignment-handles the transition correctly. Regression coverage includes `Bool -> Rect`, full schemas with and without Huffman, optional fields, and schema deltas.
-
-## Expansion-safety restoration
-
-The following forced codecs once again fall back safely when `AllowExpansion = false`:
+Measured cases:
 
 ```text
-Numeric4
-Identifier6
-ASCII7
-String LZ
-Buffer LZ
-Huffman
+12 B aligned Float64/log-style buffer -> 11 B
+12 B aligned Float64(3) buffer        ->  5 B
+Bnum-like 1,3                         ->  5 B
+Bnum-like -1,3                        ->  5 B
+Bnum-like 1,1000                      ->  6 B
 ```
 
-## SparsePower2 compatibility and validation
+## Buffer safety and malformed-input hardening
 
-v2.5.5 recovers compatible legacy v2.3.1 short `SparsePower2` data and rejects malformed bitmap padding.
+v2.6.4 keeps the v2.6.2 decode protections:
 
-## Buffer entropy framing fix
+- compressed buffer outputs are checked before allocation
+- oversized v2 buffer frames are rejected
+- oversized ZeroRun frames are rejected
+- invalid numeric buffer options are rejected
+- raw/magic collisions remain protected
+- high-entropy buffers remain expansion-safe
 
-Top-level Auto buffers now preserve their buffer type when Huffman wins. This fixed randomized Auto-buffer failures that previously decoded as an invalid generic binary header.
+## Faster Auto buffer analysis
 
-## Entropy packet metadata
+The v2.6 performance path reduces repeated buffer work by analyzing codec eligibility once and avoiding sparse metadata allocation until Sparse can actually win.
 
-Adaptive packets can report:
+Raw fallback is also allocated lazily in hot Auto paths, reducing copies that would otherwise be discarded when another codec wins.
+
+## Faster string and numeric hot paths
+
+The optimized implementation includes:
+
+- numeric three-byte keys for string LZ indexing instead of temporary substring keys
+- cached source lengths in hot LZ loops
+- a reusable Float32 exactness scratch buffer
+- exact packing behavior preserved for Numeric4, Identifier6, ASCII7, LZ, numbers, and Roblox datatypes
+
+## Faster canonical Huffman
+
+Huffman hot paths were reworked with dense byte-frequency storage, reusable heap helpers, dense encode lookup, and flatter decode lookup.
+
+The regression benchmark measured:
 
 ```text
-Entropy
-EntropyBytesBefore
-EntropyBytesAfter
-EntropySavedBytes
+Direct Huffman encode 8 KiB: 843.921 us/op
+Direct Huffman decode 8 KiB: 508.772 us/op
 ```
 
-This makes it possible to distinguish savings produced by the first-stage codec from savings produced by Huffman.
+The encoded Huffman format and deterministic canonical-code behavior remain compatible with format 25.
 
-## Measured v2.5.5 results
+## Writer and hash hot-path cleanup
 
-Selected examples from the full suite:
+Writers avoid a final buffer copy when the backing buffer is already exactly sized, and FNV-1a hashing caches the source length for its loop.
+
+These are implementation optimizations only; packet semantics are unchanged.
+
+## Luau local-register fix
+
+v2.6.3 could not load because the module exceeded Luau's top-level local/register limit:
+
+```text
+Out of local registers ... exceeded limit 200
+```
+
+v2.6.4 moves cold internal helpers onto existing internal namespaces and reduces the module to **191 top-level locals**, leaving compiler headroom while keeping performance-critical helpers local.
+
+## Packing stability
+
+The full v2.6.4 suite confirms the primary benchmark outputs remain:
+
+```text
+String: 412 B -> 190 B
+Buffer: 338 B -> 139 B
+Table:  1311 B -> 761 B
+```
+
+Core codec examples also remain stable:
 
 ```text
 String LZ:          1280 B ->   51 B
 Repetitive string:  3712 B ->  107 B
 Buffer LZ:          4096 B ->  142 B
 Skew buffer:        8192 B -> 1243 B
-UInt array:          518 B ->   93 B  vs Entropy=None representation
-Vector3 array:      3081 B ->  697 B  vs Entropy=None representation
-Color3 array:        777 B ->  144 B  vs Entropy=None representation
-Player-data table:  1311 B ->  759 B  vs Entropy=None representation
-Schema:             1939 B -> 1691 B  with Auto Huffman
+UInt array:         8192 B ->   93 B
+Vector3 array:      8192 B ->  697 B
+Color3 array:       5120 B ->  144 B
+Schema:             1939 B -> 1691 B
 ```
-
-## Performance trade-off
-
-Huffman improves many payload sizes, but it costs CPU. The v2.5.5 benchmark showed especially large overhead on table Huffman paths compared with `EntropyStrategy = "None"`.
-
-For latency-sensitive high-frequency network messages, benchmark both:
-
-```lua
-{ EntropyStrategy = "None" }
-```
-
-and:
-
-```lua
-{ EntropyStrategy = "Auto" }
-```
-
-Use the version that gives the right bandwidth/CPU trade-off for the specific packet shape.
 
 ## Regression validation
 
-The full v2.5.5 Studio suite completed with:
+The full v2.6.4 Roblox Studio suite completed with:
 
 ```text
 Module Loaded: true
-Compression Version: 2.5.5
-Tests Passed: 122
+Compression Version: 2.6.4
+Tests Passed: 132
 Tests Failed: 0
 Tests Skipped: 0
 Status: ALL PASSED
 ```
 
-Coverage includes primitives, all current string and buffer modes, direct Huffman, malformed Huffman rejection, Roblox datatypes, arrays, maps, schemas, optional fields, deltas, quantized descriptors, expansion fallbacks, legacy SparsePower2 data, hash corruption, randomized buffers, randomized arrays, randomized strings, randomized nested tables, and Bnum-compatible buffers.
+Coverage includes primitives, all current string and buffer modes, ZeroRun, direct canonical Huffman, malformed Huffman rejection, Roblox datatypes, arrays, maps, schemas, optional fields, deltas, quantized descriptors, expansion fallbacks, legacy SparsePower2 data, hash corruption, oversized-buffer rejection, randomized buffers, randomized arrays, randomized strings, randomized nested tables, and Bnum-compatible buffers.
 
 ---
-
 # Version
 
 ```lua
@@ -2735,7 +2788,7 @@ print(
 Expected:
 
 ```text
-2.5.5
+2.6.4
 ```
 
 ---
@@ -2801,4 +2854,4 @@ local ok, packet, err =
 
 https://create.roblox.com/store/asset/71588759746122/Compression
 
-That covers the main Compression v2.5.5 workflow.
+That covers the main Compression v2.6.4 workflow.
