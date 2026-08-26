@@ -52,6 +52,7 @@ The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supp
 - [Backward Compatibility](#backward-compatibility)
 - [v2.3.2 Patch Notes](#v232-patch-notes)
 - [Version](#version)
+- [Download](#download)
 
 ---
 
@@ -3144,5 +3145,9 @@ For calls that should not throw:
 local ok, packet, err =
 	Compression.TryPack(value)
 ```
+
+# Download
+
+https://create.roblox.com/store/asset/71588759746122/Compression
 
 That covers the main v2.3.2 workflow.
