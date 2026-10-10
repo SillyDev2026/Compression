@@ -1,6 +1,6 @@
 # Compression
 
-**Current version: v2.6.4**  
+**Current source version: v2.6.5 (proposed patch)**  
 **Binary format: 25**  
 **Public API: 85 functions**
 
@@ -22,6 +22,20 @@ local restored = Compression.Unpack(packet)
 ```
 
 The older `Compression.Auto()` / `Compression.AutoDecompress()` API remains supported and maps to the same adaptive compression path.
+
+---
+
+## v2.6.5 — canonical Huffman decoding
+
+This maintenance patch retains **binary format 25** and all existing public APIs. It adds three decoder validations:
+
+- Rejects Huffman codebooks that advertise more distinct symbols than the number of decoded bytes.
+- Rejects encoded bit lengths that cannot represent the advertised output size with the supplied Huffman code lengths.
+- Rejects nonzero padding bits in the final Huffman byte. Such packets were previously accepted even though the extra bits are not part of the encoded output.
+
+Existing well-formed v2.6.4 packets still use the same on-wire format and should decode identically. This does **not** change compression ratios or establish a performance gain.
+
+Run `tests/HuffmanCanonicalRegression.server.lua` under Roblox Studio with the library as a sibling ModuleScript named `Compress`. It checks a valid roundtrip, an empty packet and corruption rejection. Run Script Analysis and broader saved-packet compatibility tests before merging. Full `--!strict` validation remains outstanding for the large source file.
 
 ---
 
