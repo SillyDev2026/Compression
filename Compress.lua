@@ -875,6 +875,7 @@ local function huffmanDecodeFrame(data: buffer): buffer
 		return buffer.create(0)
 	end
 	if symbolCount > 256 then fail("invalid Huffman symbol count", 2) end
+    if originalLength < symbolCount then fail("Huffman symbol count exceeds output length", 2) end
 
 	if symbolCount == 1 then
 		if r.Position + 1 ~= r.Length then fail("invalid single-symbol Huffman frame", 2) end
@@ -904,6 +905,9 @@ local function huffmanDecodeFrame(data: buffer): buffer
 	end
 
 	local bitLength = readVarUInt(r)
+    if bitLength < originalLength or bitLength > originalLength * maxLength then
+        fail("invalid Huffman bit length", 2)
+    end
 	local payloadBytes = math.ceil(bitLength / 8)
 	if r.Position + payloadBytes ~= r.Length then fail("invalid Huffman payload length", 2) end
 	local body: Reader = {
@@ -936,6 +940,7 @@ local function huffmanDecodeFrame(data: buffer): buffer
 	end
 
 	if consumedBits ~= bitLength then fail("Huffman bit length mismatch", 2) end
+    if body.BitBuffer ~= 0 then fail("nonzero Huffman padding bits", 2) end
 	return result
 end
 
@@ -7874,7 +7879,7 @@ end
 
 -- Handles version.
 function Compression.Version(): string
-	return "2.6.4"
+	return "2.6.5"
 end
 
 return Compression
